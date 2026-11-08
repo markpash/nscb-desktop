@@ -16,9 +16,9 @@ Built in Rust with [GPUI Kit](https://gpui-kit.com) (GPUI + gpui-component). Pow
 - Rename files using package metadata + NUTDB lookup, with Basic/Advanced controls for rename mode, language, version handling, and DLC naming
 - NUTDB utilities: refresh cache, look up title IDs
 - Verify container integrity (NSP, NSX, NSZ, XCI, XCZ) at three levels: decryption (lv1), signature (lv2), or full (lv3)
-- View file info (content details and metadata summary)
+- View file info: titles, versions, firmware requirements, languages and contents
 - Drag & drop files or folders (rename supports recursive folder input)
-- Live output console + progress tracking
+- Live progress with per-file status, output files you can reveal in Finder/Explorer, and structured results (title info cards, verification findings, rename results)
 - Batch support for compress/decompress/convert/split/rename/verify
 - Dark theme UI with SVG iconography and file type badges
 - nscb_rust engine built in: a single executable, no separate backend download
@@ -63,7 +63,7 @@ Requires [Rust](https://rustup.rs) (stable). On Linux, install the GPUI build de
 
 ```bash
 cargo run                # Run the app (debug)
-cargo test --workspace   # Unit tests (app + nscb) + headless UI integration tests
+cargo test --workspace   # Unit tests (app + nscb)
 ```
 
 ## Build
@@ -87,11 +87,10 @@ nscb-desktop/
 |- src/
 |  |- main.rs              # Entry point
 |  |- lib.rs               # App bootstrap: window, menus, theme, assets
-|  |- engine.rs            # Runs the vendored nscb library in-process
-|  |- runner.rs            # Worker-thread runs, event streaming, batching
+|  |- jobs.rs              # Typed jobs, steps and outcomes
+|  |- engine.rs            # Runs steps through the nscb library API
+|  |- runner.rs            # Worker-thread runs, progress and result events
 |  |- core/                # UI-independent logic (unit tested)
-|  |  |- args.rs           # CLI argument building
-|  |  |- progress.rs       # stdout/stderr progress parsing
 |  |  |- batch.rs          # Batch merge discovery and matching
 |  |  |- tools.rs          # Tools dir, keys import, settings
 |  |  `- github.rs         # App update check
@@ -99,10 +98,10 @@ nscb-desktop/
 |     |- app.rs            # Shell: setup screen, sidebar, toasts, banner
 |     |- theme.rs          # Dark palette on top of the gpui-kit theme
 |     |- icons.rs          # App SVG icons + asset source
-|     |- widgets.rs        # Drop zone, file list, progress console, etc.
+|     |- widgets.rs        # Drop zone, file list, selects, etc.
+|     |- job_view.rs       # Progress panel and structured result views
 |     `- pages/            # One module per page
 |- crates/nscb/           # Vendored nscb_rust (see crates/nscb/VENDORED.md)
-|- tests/ui.rs             # Headless UI tests against a fake engine
 |- assets/                 # SVG icons and app icons
 |- build.rs                # Embeds the Windows exe icon
 `- scripts/portable.sh     # Portable folder assembly

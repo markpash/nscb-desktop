@@ -1,7 +1,10 @@
 //! Config-driven page for single-input operations: Compress, Decompress, Convert,
 //! Split and Split to Files.
 
-use crate::core::args::{Op, RunOptions};
+use crate::jobs::{Job, JobKind};
+use crate::ui::job_view::JobView;
+use nscb::api::Format;
+use std::path::PathBuf;
 use crate::runner::{Runner, RunnerEvent, Source};
 use crate::ui::icons::AppIcon;
 use crate::ui::theme::{self, hex, hexa, Accent};
@@ -23,9 +26,19 @@ pub enum PageOptions {
     },
 }
 
+/// The operation a page runs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum OpJob {
+    Compress,
+    Decompress,
+    Convert,
+    Split,
+    SplitToFiles,
+}
+
 pub struct OpConfig {
     pub source: Source,
-    pub op: Op,
+    pub op: OpJob,
     pub id: &'static str,
     pub icon: AppIcon,
     pub accent: Accent,
@@ -33,7 +46,6 @@ pub struct OpConfig {
     pub subtitle: &'static str,
     pub drop: DropSpec,
     pub start_label: &'static str,
-    pub start_message: &'static str,
     pub options: PageOptions,
 }
 
@@ -41,7 +53,7 @@ pub const FORMAT_OPTIONS: &[Opt] = &[opt("xci", "XCI (Game Cartridge)"), opt("ns
 
 pub const COMPRESS: OpConfig = OpConfig {
     source: Source::Compress,
-    op: Op::Compress,
+    op: OpJob::Compress,
     id: "compress",
     icon: AppIcon::Compress,
     accent: Accent::Compress,
@@ -49,13 +61,12 @@ pub const COMPRESS: OpConfig = OpConfig {
     subtitle: "Compress NSP/XCI files to NSZ/XCZ format",
     drop: DropSpec { accept: &["nsp", "xci"], hint: "Drop NSP or XCI files to compress", allow_folders: false },
     start_label: "Start Compression",
-    start_message: "Starting compression...",
     options: PageOptions::Compress,
 };
 
 pub const DECOMPRESS: OpConfig = OpConfig {
     source: Source::Decompress,
-    op: Op::Decompress,
+    op: OpJob::Decompress,
     id: "decompress",
     icon: AppIcon::Decompress,
     accent: Accent::Decompress,
@@ -67,13 +78,12 @@ pub const DECOMPRESS: OpConfig = OpConfig {
         allow_folders: false,
     },
     start_label: "Start Decompression",
-    start_message: "Starting decompression...",
     options: PageOptions::None,
 };
 
 pub const CONVERT: OpConfig = OpConfig {
     source: Source::Convert,
-    op: Op::Convert,
+    op: OpJob::Convert,
     id: "convert",
     icon: AppIcon::Convert,
     accent: Accent::Convert,
@@ -81,13 +91,12 @@ pub const CONVERT: OpConfig = OpConfig {
     subtitle: "Convert between NSP and XCI formats",
     drop: DropSpec { accept: &["nsp", "xci"], hint: "Drop NSP or XCI files to convert", allow_folders: false },
     start_label: "Start Conversion",
-    start_message: "Starting conversion...",
     options: PageOptions::Format { title: "Convert Options", xci: "Convert NSP \u{2192} XCI", nsp: "Convert XCI \u{2192} NSP" },
 };
 
 pub const SPLIT: OpConfig = OpConfig {
     source: Source::Split,
-    op: Op::Split,
+    op: OpJob::Split,
     id: "split",
     icon: AppIcon::Split,
     accent: Accent::Split,
@@ -99,13 +108,12 @@ pub const SPLIT: OpConfig = OpConfig {
         allow_folders: false,
     },
     start_label: "Start Split",
-    start_message: "Starting split...",
     options: PageOptions::None,
 };
 
 pub const DSPL: OpConfig = OpConfig {
     source: Source::Dspl,
-    op: Op::Dspl,
+    op: OpJob::SplitToFiles,
     id: "dspl",
     icon: AppIcon::Dspl,
     accent: Accent::Dspl,
@@ -117,7 +125,6 @@ pub const DSPL: OpConfig = OpConfig {
         allow_folders: false,
     },
     start_label: "Start Split",
-    start_message: "Starting split to files...",
     options: PageOptions::Format {
         title: "Split Options",
         xci: "Output individual XCI files",
@@ -130,7 +137,7 @@ pub struct OperationPage {
     runner: Entity<Runner>,
     files: Vec<String>,
     output: Entity<InputState>,
-    run: RunView,
+    job: JobView,
     level: Entity<SliderState>,
     level_value: u32,
     format: OptSelect,
@@ -147,7 +154,7 @@ impl OperationPage {
         let subscriptions = vec![
             cx.subscribe(&runner, |this, _, event: &RunnerEvent, cx| {
                 if event.source() == this.config.source {
-                    this.run.apply(event);
+                    this.job.apply(event);
                     cx.notify();
                 }
             }),
@@ -169,7 +176,7 @@ impl OperationPage {
             runner,
             files: Vec::new(),
             output,
-            run: RunView::default(),
+            job: JobView::default(),
             level,
             level_value: 18,
             format,
@@ -182,8 +189,8 @@ impl OperationPage {
         &self.files
     }
 
-    pub fn run_view(&self) -> &RunView {
-        &self.run
+    pub fn job_view(&self) -> &JobView {
+        &self.job
     }
 
     /// Output directory follows the first file's directory whenever the list changes.
@@ -193,39 +200,47 @@ impl OperationPage {
     }
 
     fn remove_file(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if index < self.files.len() {
+        if index < self.files.len() && !self.job.running {
             self.files.remove(index);
+            self.job.clear();
             self.sync_output(window, cx);
             cx.notify();
         }
     }
 
+    fn job_kind(&self) -> JobKind {
+        let format = if self.format_value == "nsp" { Format::Nsp } else { Format::Xci };
+        match self.config.op {
+            OpJob::Compress => JobKind::Compress { level: self.level_value as i32 },
+            OpJob::Decompress => JobKind::Decompress,
+            OpJob::Convert => JobKind::Convert(format),
+            OpJob::Split => JobKind::Split,
+            OpJob::SplitToFiles => JobKind::SplitToFiles(format),
+        }
+    }
+
     fn start(&mut self, cx: &mut Context<Self>) {
-        if self.files.is_empty() {
+        if self.files.is_empty() || self.job.running {
             return;
         }
-        self.run.start(self.config.start_message);
         let output = input_value(&self.output, cx);
-        let mut options = RunOptions { output: (!output.is_empty()).then_some(output), ..Default::default() };
-        match self.config.options {
-            PageOptions::Compress => options.level = Some(self.level_value),
-            PageOptions::Format { .. } => options.format = Some(self.format_value.to_string()),
-            PageOptions::None => {}
-        }
-        let (source, op, files) = (self.config.source, self.config.op, self.files.clone());
-        self.runner.update(cx, |r, cx| r.run(source, op, files, options, cx)).detach();
+        let job = Job::new(self.job_kind(), self.files.iter().map(PathBuf::from).collect())
+            .with_out_dir((!output.trim().is_empty()).then(|| PathBuf::from(output.trim())));
+        self.job.start(job.kind.verb(), self.files.iter().map(|f| basename(f).to_string()).collect());
+        let source = self.config.source;
+        self.runner.update(cx, |r, cx| r.run(source, job, cx)).detach();
         cx.notify();
     }
 
     fn cancel(&mut self, cx: &mut Context<Self>) {
         self.runner.update(cx, |r, _| r.cancel());
-        self.run.cancelled();
+        self.job.cancel();
         cx.notify();
     }
 
     fn clear(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.files.clear();
-        self.run.clear();
+        self.job.clear();
         self.sync_output(window, cx);
         cx.notify();
     }
@@ -294,6 +309,10 @@ impl OperationPage {
 
 impl FileTarget for OperationPage {
     fn add_files(&mut self, files: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.job.running {
+            return;
+        }
+        self.job.clear();
         add_unique(&mut self.files, files);
         self.sync_output(window, cx);
         cx.notify();
@@ -307,13 +326,13 @@ impl Render for OperationPage {
         accept_drops(page().id(config.id), config.drop, cx)
             .child(page_header(config.icon, config.accent, config.title, config.subtitle))
             .child(drop_zone("drop-zone", config.drop, cx))
-            .children(file_list("files", &self.files, cx, Self::remove_file))
+            .children(file_list("files", &self.files, Some(&self.job), cx, Self::remove_file))
             .when(has_files, |this| {
                 this.children(self.render_options())
                     .child(output_dir_picker("browse-output", &self.output, cx, |p: &Self| &p.output))
-                    .children(self.run.render("progress", cx))
+                    .children(self.job.status_panel("status", false))
                     .child(action_bar(
-                        self.run.running,
+                        self.job.running,
                         config.start_label,
                         self.files.is_empty(),
                         cx.listener(|this, _: &ClickEvent, _, cx| this.cancel(cx)),

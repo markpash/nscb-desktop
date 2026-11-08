@@ -1,0 +1,5 @@
+# aes 0.8 uses the ARMv8 AES instructions (detected at runtime, with a software
+# fallback) only when built with this cfg; on x86 it detects AES-NI on its own.
+# Without it, AES-CTR decryption on Apple Silicon runs ~20x slower.
+[target.'cfg(target_arch = "aarch64")']
+rustflags = ["--cfg", "aes_armv8"]

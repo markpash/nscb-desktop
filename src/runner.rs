@@ -1,18 +1,17 @@
-//! Runs backend operations on a worker thread through an [`Engine`], streams their
-//! output as [`RunnerEvent`]s and batches single-file operations sequentially.
+//! Runs [`Job`]s step by step on a worker thread through an [`Engine`] and reports
+//! progress and per-step results as [`RunnerEvent`]s.
 
-use crate::core::args::{basename, build_args, dirname, Op, RunOptions};
-use crate::core::progress::{parse_stdout_line, Parsed};
-use crate::core::tools::{Tools, SETTING_TEMP_DIR};
-use crate::engine::{Engine, EngineMsg, RunContext};
-use futures::channel::mpsc;
-use futures::StreamExt;
-use gpui_kit::{AsyncApp, Context, EventEmitter, Task, WeakEntity};
+use crate::core::tools::{Tools, DEFAULT_NUTDB_URL, SETTING_NUTDB_URL, SETTING_PROXY, SETTING_TEMP_DIR};
+use crate::engine::{Engine, EngineSettings, Progress, RunContext};
+use crate::jobs::{Job, Partial, Step, StepResult};
+use futures::channel::oneshot;
+use gpui_kit::{Context, EventEmitter, Task};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Which page started a run; events are routed back to it.
+/// Which page started a job; events are routed back to it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Source {
     Compress,
@@ -30,48 +29,54 @@ pub enum Source {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum RunnerEvent {
-    Progress { source: Source, percent: f32, message: String },
-    Output { source: Source, line: String },
-    Done { source: Source, code: i32 },
-    Error { source: Source, message: String },
+    StepStarted { source: Source, index: usize },
+    Progress { source: Source, index: usize, progress: Progress },
+    /// An intermediate result from a running step.
+    Partial { source: Source, index: usize, partial: Partial },
+    StepFinished { source: Source, index: usize, result: StepResult },
+    /// Every step ran (some may have failed).
+    Finished { source: Source },
+    /// Another job was running, so this one did not start.
+    Rejected { source: Source, message: String },
 }
 
 impl RunnerEvent {
     pub fn source(&self) -> Source {
         match self {
-            RunnerEvent::Progress { source, .. }
-            | RunnerEvent::Output { source, .. }
-            | RunnerEvent::Done { source, .. }
-            | RunnerEvent::Error { source, .. } => *source,
+            RunnerEvent::StepStarted { source, .. }
+            | RunnerEvent::Progress { source, .. }
+            | RunnerEvent::Partial { source, .. }
+            | RunnerEvent::StepFinished { source, .. }
+            | RunnerEvent::Finished { source }
+            | RunnerEvent::Rejected { source, .. } => *source,
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RunOutcome {
-    /// The run finished; the exit code of the last invocation.
-    Completed(i32),
-    Cancelled,
-    /// Another run was in progress.
-    Rejected,
+/// Messages from the worker thread while a step runs.
+enum Update {
+    Progress(Progress),
+    Partial(Partial),
 }
 
-enum WorkerMsg {
-    Engine(EngineMsg),
-    Exited(i32),
+#[derive(Clone, Debug, PartialEq)]
+pub enum JobOutcome {
+    /// One result per step.
+    Finished(Vec<StepResult>),
+    Cancelled,
+    Rejected,
 }
 
 pub struct Runner {
     tools: Tools,
     engine: Arc<dyn Engine>,
-    active: Option<Op>,
-    /// Incremented by every run and cancel; a run whose generation is stale stops.
+    active: Option<&'static str>,
+    /// Incremented by every job and cancel; a job whose generation is stale stops.
     generation: u64,
-    /// Cancel flag of the invocation currently on the worker thread.
+    /// Cancel flag of the step currently on the worker thread.
     cancel_flag: Option<Arc<AtomicBool>>,
-    /// Set while an engine invocation is executing (including a cancelled one winding down).
+    /// Set while a step is executing (including a cancelled one winding down).
     worker_busy: Arc<AtomicBool>,
-    last_output_line: String,
 }
 
 impl EventEmitter<RunnerEvent> for Runner {}
@@ -85,7 +90,6 @@ impl Runner {
             generation: 0,
             cancel_flag: None,
             worker_busy: Arc::new(AtomicBool::new(false)),
-            last_output_line: String::new(),
         }
     }
 
@@ -97,136 +101,107 @@ impl Runner {
         self.active.is_some()
     }
 
-    /// Run `op` over `files`. Single-file ops run once per file. Progress, output and
-    /// errors are emitted as events tagged with `source`.
-    pub fn run(
-        &mut self,
-        source: Source,
-        op: Op,
-        files: Vec<String>,
-        options: RunOptions,
-        cx: &mut Context<Self>,
-    ) -> Task<RunOutcome> {
-        if let Some(active) = self.active {
-            let message = format!("A process is already running ({})", active.name());
-            cx.emit(RunnerEvent::Error { source, message });
-            cx.emit(RunnerEvent::Done { source, code: -1 });
-            return Task::ready(RunOutcome::Rejected);
+    fn settings(&self) -> EngineSettings {
+        let keys = self.tools.keys_path();
+        let keys_txt = self.tools.dir().join("keys.txt");
+        let keys_path = if !keys.exists() && keys_txt.exists() { keys_txt } else { keys };
+        let temp_dir = self.tools.setting(SETTING_TEMP_DIR);
+        let mut url = self.tools.setting(SETTING_NUTDB_URL);
+        if url.is_empty() {
+            url = DEFAULT_NUTDB_URL.into();
         }
+        EngineSettings {
+            keys_path: Some(keys_path),
+            temp_dir: (!temp_dir.is_empty()).then(|| PathBuf::from(temp_dir)),
+            nutdb_url: Some(format!("{}{url}", self.tools.setting(SETTING_PROXY))),
+        }
+    }
 
+    /// Run a job. Per-input jobs run one step per input; a failed step does not stop
+    /// the remaining ones.
+    pub fn run(&mut self, source: Source, job: Job, cx: &mut Context<Self>) -> Task<JobOutcome> {
+        if let Some(active) = self.active {
+            cx.emit(RunnerEvent::Rejected {
+                source,
+                message: format!("Another operation is running ({})", active.to_lowercase()),
+            });
+            return Task::ready(JobOutcome::Rejected);
+        }
         self.generation += 1;
         let generation = self.generation;
-        self.active = Some(op);
-
-        let batches: Vec<Vec<String>> = if op.is_single_file() && files.len() > 1 {
-            files.into_iter().map(|f| vec![f]).collect()
-        } else {
-            vec![files]
-        };
+        self.active = Some(job.kind.verb());
+        let steps = job.steps();
 
         cx.spawn(async move |this, cx| {
-            let total = batches.len();
-            for (index, batch) in batches.into_iter().enumerate() {
-                // A cancelled invocation may still be winding down on the worker.
-                let busy = this.read_with(cx, |r, _| r.worker_busy.clone());
-                let Ok(busy) = busy else { return RunOutcome::Cancelled };
+            let mut results = Vec::with_capacity(steps.len());
+            for (index, step) in steps.into_iter().enumerate() {
+                // A cancelled step may still be winding down on the worker.
+                let Ok(busy) = this.read_with(cx, |r, _| r.worker_busy.clone()) else {
+                    return JobOutcome::Cancelled;
+                };
                 while busy.load(Ordering::SeqCst) {
                     cx.background_executor().timer(Duration::from_millis(20)).await;
                 }
 
-                let prepared = this.update(cx, |runner, cx| {
+                let started = this.update(cx, |runner, cx| {
                     if runner.generation != generation {
                         return None;
                     }
-                    if total > 1 {
-                        let name = batch.first().map(|f| basename(f)).unwrap_or_default();
-                        cx.emit(RunnerEvent::Output {
-                            source,
-                            line: format!("[File {}/{}] {}", index + 1, total, name),
-                        });
-                    }
-                    let (args, verify_output) = runner.prepare(source, op, &batch, &options, cx);
-                    Some((runner.start_worker(args), verify_output))
+                    cx.emit(RunnerEvent::StepStarted { source, index });
+                    Some(runner.start_worker(step))
                 });
-                let Ok(Some((rx, verify_output))) = prepared else {
-                    return RunOutcome::Cancelled;
+                let Ok(Some((mut progress_rx, done_rx))) = started else {
+                    return JobOutcome::Cancelled;
                 };
 
-                let Some(code) = Self::pump(&this, cx, rx, source, generation).await else {
-                    return RunOutcome::Cancelled;
-                };
-
-                let finished = this.update(cx, |runner, cx| {
-                    if runner.generation != generation {
-                        return RunOutcome::Cancelled;
-                    }
-                    if let Some(path) = &verify_output {
-                        if let Ok(content) = std::fs::read_to_string(path) {
-                            for line in content.lines().map(str::trim).filter(|l| !l.is_empty()) {
-                                cx.emit(RunnerEvent::Output { source, line: line.to_string() });
+                // Forward updates until the step finishes.
+                let forward = async {
+                    use futures::StreamExt;
+                    while let Some(update) = progress_rx.next().await {
+                        let live = this.update(cx, |runner, cx| {
+                            if runner.generation != generation {
+                                return false;
                             }
+                            cx.emit(match update {
+                                Update::Progress(progress) => RunnerEvent::Progress { source, index, progress },
+                                Update::Partial(partial) => RunnerEvent::Partial { source, index, partial },
+                            });
+                            true
+                        });
+                        if !matches!(live, Ok(true)) {
+                            break;
                         }
                     }
-                    if code != 0 {
-                        runner.active = None;
-                        let message = if runner.last_output_line.is_empty() {
-                            format!("nscb_rust failed with code {code}")
-                        } else {
-                            format!("nscb_rust failed with code {code}: {}", runner.last_output_line)
-                        };
-                        cx.emit(RunnerEvent::Error { source, message });
-                        cx.emit(RunnerEvent::Done { source, code });
+                };
+                forward.await;
+                let result = done_rx.await.unwrap_or_else(|_| Err("The operation stopped unexpectedly".into()));
+
+                let still_live = this.update(cx, |runner, cx| {
+                    if runner.generation != generation {
+                        return false;
                     }
-                    RunOutcome::Completed(code)
+                    cx.emit(RunnerEvent::StepFinished { source, index, result: result.clone() });
+                    true
                 });
-                match finished {
-                    Ok(RunOutcome::Completed(0)) => continue,
-                    Ok(outcome) => return outcome,
-                    Err(_) => return RunOutcome::Cancelled,
+                if !matches!(still_live, Ok(true)) {
+                    return JobOutcome::Cancelled;
                 }
+                results.push(result);
             }
 
             this.update(cx, |runner, cx| {
                 if runner.generation != generation {
-                    return RunOutcome::Cancelled;
+                    return JobOutcome::Cancelled;
                 }
                 runner.active = None;
-                cx.emit(RunnerEvent::Progress { source, percent: 100.0, message: "Done!".into() });
-                cx.emit(RunnerEvent::Done { source, code: 0 });
-                RunOutcome::Completed(0)
+                cx.emit(RunnerEvent::Finished { source });
+                JobOutcome::Finished(results)
             })
-            .unwrap_or(RunOutcome::Cancelled)
+            .unwrap_or(JobOutcome::Cancelled)
         })
     }
 
-    /// Forward worker messages until the invocation exits; `None` if the run was cancelled.
-    async fn pump(
-        this: &WeakEntity<Self>,
-        cx: &mut AsyncApp,
-        mut rx: mpsc::UnboundedReceiver<WorkerMsg>,
-        source: Source,
-        generation: u64,
-    ) -> Option<i32> {
-        while let Some(msg) = rx.next().await {
-            let msg = match msg {
-                WorkerMsg::Exited(code) => return Some(code),
-                WorkerMsg::Engine(msg) => msg,
-            };
-            let live = this.update(cx, |runner, cx| {
-                if runner.generation != generation {
-                    return false;
-                }
-                runner.handle_engine_msg(source, msg, cx);
-                true
-            });
-            if !matches!(live, Ok(true)) {
-                return None;
-            }
-        }
-        Some(-1)
-    }
-
-    /// Stop the running operation. No further events are emitted for the cancelled run.
+    /// Stop the running job. No further events are emitted for it.
     pub fn cancel(&mut self) {
         self.generation += 1;
         self.active = None;
@@ -235,88 +210,38 @@ impl Runner {
         }
     }
 
-    /// Build the argument list (and, for verify, the file list and result path).
-    fn prepare(
+    fn start_worker(
         &mut self,
-        source: Source,
-        op: Op,
-        files: &[String],
-        options: &RunOptions,
-        cx: &mut Context<Self>,
-    ) -> (Vec<String>, Option<String>) {
-        let mut options = options.clone();
-        let mut verify_output = None;
-        if op == Op::Verify {
-            match self.tools.create_verify_filelist(files.first().map(String::as_str).unwrap_or_default()) {
-                Ok(list) => {
-                    let list = list.to_string_lossy().into_owned();
-                    let base = basename(&list);
-                    let stem = base
-                        .strip_suffix(".txt")
-                        .or_else(|| base.strip_suffix(".TXT"))
-                        .unwrap_or(base);
-                    verify_output = Some(format!("{}/INFO/MASSVERIFY/{stem}-verify.txt", dirname(&list)));
-                    options.filelist_path = Some(list);
-                }
-                Err(message) => cx.emit(RunnerEvent::Error { source, message }),
-            }
-        }
-        options.temp_dir = Some(self.tools.setting(SETTING_TEMP_DIR));
-        let keys = self.tools.keys_path().to_string_lossy().into_owned();
-        let args = build_args(op, files, &options, op.uses_keys().then_some(keys.as_str()));
-
-        self.last_output_line.clear();
-        cx.emit(RunnerEvent::Output { source, line: format!("> nscb_rust {}", args.join(" ")) });
-        (args, verify_output)
-    }
-
-    fn start_worker(&mut self, args: Vec<String>) -> mpsc::UnboundedReceiver<WorkerMsg> {
-        let (tx, rx) = mpsc::unbounded();
+        step: Step,
+    ) -> (futures::channel::mpsc::UnboundedReceiver<Update>, oneshot::Receiver<StepResult>) {
+        let (progress_tx, progress_rx) = futures::channel::mpsc::unbounded();
+        let (done_tx, done_rx) = oneshot::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         self.cancel_flag = Some(cancel.clone());
         let busy = self.worker_busy.clone();
         busy.store(true, Ordering::SeqCst);
         let engine = self.engine.clone();
+        let settings = self.settings();
 
         std::thread::Builder::new()
             .name("nscb-worker".into())
             .spawn(move || {
-                let emit_tx = tx.clone();
+                let partial_tx = progress_tx.clone();
                 let ctx = RunContext::new(
-                    move |msg| {
-                        let _ = emit_tx.unbounded_send(WorkerMsg::Engine(msg));
+                    move |p| {
+                        let _ = progress_tx.unbounded_send(Update::Progress(p));
                     },
                     cancel,
-                );
-                let code = engine.run(args, ctx);
+                )
+                .on_partial(move |p| {
+                    let _ = partial_tx.unbounded_send(Update::Partial(p));
+                });
+                let result = engine.run(&step, &settings, ctx);
                 busy.store(false, Ordering::SeqCst);
-                let _ = tx.unbounded_send(WorkerMsg::Exited(code));
+                // Dropping the context closes the progress channel before the result arrives.
+                let _ = done_tx.send(result);
             })
             .expect("failed to spawn nscb worker thread");
-        rx
-    }
-
-    fn handle_engine_msg(&mut self, source: Source, msg: EngineMsg, cx: &mut Context<Self>) {
-        match msg {
-            EngineMsg::Line(line) => {
-                self.last_output_line = line.clone();
-                let parsed = parse_stdout_line(&line);
-                cx.emit(RunnerEvent::Output { source, line });
-                match parsed {
-                    Some(Parsed::Progress { percent, message }) => {
-                        cx.emit(RunnerEvent::Progress { source, percent, message })
-                    }
-                    Some(Parsed::Error(message)) => cx.emit(RunnerEvent::Error { source, message }),
-                    Some(Parsed::Status { .. }) | None => {}
-                }
-            }
-            EngineMsg::Error(message) => {
-                self.last_output_line = message.clone();
-                cx.emit(RunnerEvent::Error { source, message });
-            }
-            EngineMsg::Progress { percent, message } => {
-                cx.emit(RunnerEvent::Progress { source, percent, message });
-            }
-        }
+        (progress_rx, done_rx)
     }
 }

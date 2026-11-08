@@ -1,7 +1,10 @@
 //! Merge: combine base, update and DLC files into one XCI/NSP.
 
 use super::operation::FORMAT_OPTIONS;
-use crate::core::args::{Op, RunOptions};
+use crate::jobs::{Job, JobKind};
+use crate::ui::job_view::{error_text, JobView};
+use nscb::api::{Format, MergeOptions};
+use std::path::PathBuf;
 use crate::runner::{Runner, RunnerEvent, Source};
 use crate::ui::icons::AppIcon;
 use crate::ui::theme::Accent;
@@ -23,7 +26,8 @@ pub struct MergePage {
     runner: Entity<Runner>,
     files: Vec<String>,
     output: Entity<InputState>,
-    run: RunView,
+    job: JobView,
+    validation: Option<String>,
     format: OptSelect,
     format_value: &'static str,
     nodelta: bool,
@@ -39,7 +43,7 @@ impl MergePage {
         let subscriptions = vec![
             cx.subscribe(&runner, |this, _, event: &RunnerEvent, cx| {
                 if event.source() == Source::Merge {
-                    this.run.apply(event);
+                    this.job.apply(event);
                     cx.notify();
                 }
             }),
@@ -54,7 +58,8 @@ impl MergePage {
             runner,
             files: Vec::new(),
             output: text_input("Default: same as source file", "", window, cx),
-            run: RunView::default(),
+            job: JobView::default(),
+            validation: None,
             format,
             format_value: "xci",
             nodelta: false,
@@ -71,42 +76,66 @@ impl MergePage {
     }
 
     fn remove_file(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if index < self.files.len() {
+        if index < self.files.len() && !self.job.running {
             self.files.remove(index);
+            self.job.clear();
             self.sync_output(window, cx);
             cx.notify();
         }
     }
 
+    /// Merge options from the form, or a message describing an invalid field.
+    fn options(&self, cx: &gpui_kit::App) -> Result<MergeOptions, String> {
+        let rsv = input_value(&self.rsvcap, cx);
+        let keygen = input_value(&self.keypatch, cx);
+        let rsv_cap = match rsv.trim() {
+            "" => None,
+            v => Some(v.parse::<u32>().map_err(|_| "RSV Cap must be a whole number".to_string())?),
+        };
+        let key_generation = match keygen.trim() {
+            "" => None,
+            v => Some(v.parse::<u8>().map_err(|_| "Key Generation Patch must be a number from 0 to 255".to_string())?),
+        };
+        Ok(MergeOptions {
+            format: if self.format_value == "nsp" { Format::Nsp } else { Format::Xci },
+            exclude_deltas: self.nodelta,
+            rsv_cap,
+            key_generation,
+            log_firmware: self.pv,
+        })
+    }
+
     fn start(&mut self, cx: &mut Context<Self>) {
-        if self.files.is_empty() {
+        if self.files.is_empty() || self.job.running {
             return;
         }
-        self.run.start("Starting merge...");
-        let nonempty = |s: String| (!s.trim().is_empty()).then(|| s.trim().to_string());
-        let options = RunOptions {
-            output: nonempty(input_value(&self.output, cx)),
-            format: Some(self.format_value.to_string()),
-            nodelta: self.nodelta,
-            pv: self.pv,
-            rsvcap: nonempty(input_value(&self.rsvcap, cx)),
-            keypatch: nonempty(input_value(&self.keypatch, cx)),
-            ..Default::default()
+        let options = match self.options(cx) {
+            Ok(options) => options,
+            Err(message) => {
+                self.validation = Some(message);
+                cx.notify();
+                return;
+            }
         };
-        let files = self.files.clone();
-        self.runner.update(cx, |r, cx| r.run(Source::Merge, Op::Merge, files, options, cx)).detach();
+        self.validation = None;
+        let output = input_value(&self.output, cx);
+        let job = Job::new(JobKind::Merge(options), self.files.iter().map(PathBuf::from).collect())
+            .with_out_dir((!output.trim().is_empty()).then(|| PathBuf::from(output.trim())));
+        self.job.start(job.kind.verb(), vec![format!("{} files", self.files.len())]);
+        self.runner.update(cx, |r, cx| r.run(Source::Merge, job, cx)).detach();
         cx.notify();
     }
 
     fn cancel(&mut self, cx: &mut Context<Self>) {
         self.runner.update(cx, |r, _| r.cancel());
-        self.run.cancelled();
+        self.job.cancel();
         cx.notify();
     }
 
     fn clear(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.files.clear();
-        self.run.clear();
+        self.job.clear();
+        self.validation = None;
         self.sync_output(window, cx);
         cx.notify();
     }
@@ -114,6 +143,10 @@ impl MergePage {
 
 impl FileTarget for MergePage {
     fn add_files(&mut self, files: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.job.running {
+            return;
+        }
+        self.job.clear();
         add_unique(&mut self.files, files);
         self.sync_output(window, cx);
         cx.notify();
@@ -143,7 +176,7 @@ impl Render for MergePage {
                     .gap(px(12.))
                     .p(px(12.))
                     .child(drop_zone("drop-zone", DROP, cx))
-                    .children(file_list("files", &self.files, cx, Self::remove_file)),
+                    .children(file_list("files", &self.files, None, cx, Self::remove_file)),
             ))
             .when(has_files, |this| {
                 this.child(card(
@@ -184,9 +217,10 @@ impl Render for MergePage {
                         )),
                 ))
                 .child(output_dir_picker("browse-output", &self.output, cx, |p: &Self| &p.output))
-                .children(self.run.render("progress", cx))
+                .children(self.job.status_panel("status", true))
+                .children(self.validation.clone().map(|v| error_text(&v)))
                 .child(action_bar(
-                    self.run.running,
+                    self.job.running,
                     "Start Merge",
                     !has_files,
                     cx.listener(|this, _: &ClickEvent, _, cx| this.cancel(cx)),

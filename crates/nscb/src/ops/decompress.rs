@@ -11,9 +11,13 @@ use crate::formats::xci::{Xci, XciBuilder, XCI_PREFIX_SIZE};
 use crate::util::{io as uio, progress};
 
 enum EntrySource {
-    Temp(tempfile::NamedTempFile),
+    /// Decompressed from the NCZ at `abs_offset` straight into the output.
+    Ncz { abs_offset: u64, compressed_size: u64, nca_size: u64 },
     Input { abs_offset: u64, size: u64 },
 }
+
+/// Output buffer size; decompressed chunks are written through it.
+const OUT_BUFFER: usize = 1 << 20;
 
 struct PackedSecureEntry {
     name: String,
@@ -49,39 +53,30 @@ pub fn decompress_with_temp_dir(
     }
 }
 
-fn decompress_nsz(input_path: &str, output_path: &str, temp_dir: Option<&Path>) -> Result<()> {
+fn decompress_nsz(input_path: &str, output_path: &str, _temp_dir: Option<&Path>) -> Result<()> {
     crate::outln!("Decompressing NSZ to NSP...");
 
     let mut file = BufReader::new(File::open(input_path)?);
     let nsp = Nsp::parse(&mut file)?;
 
-    let mut decompressed_files: Vec<(String, tempfile::NamedTempFile, u64)> = Vec::new();
+    // (name, abs_offset, compressed size, decompressed size); sizes are known up front,
+    // so each NCZ is decompressed straight into the output.
+    let mut ncz_files: Vec<(String, u64, u64, u64)> = Vec::new();
     let mut passthrough_files: Vec<(String, u64, u64)> = Vec::new();
 
     for entry in nsp.all_entries() {
+        let abs_offset = nsp.file_abs_offset(entry);
         if entry.name.ends_with(".ncz") {
-            let nca_name = entry.name.replace(".ncz", ".nca");
-            let abs_offset = nsp.file_abs_offset(entry);
-
-            crate::outln!("  Decompressing {}...", entry.name);
-            let mut tmp = crate::util::temp::named_file(temp_dir)?;
             let ncz = ncz::NczReader::parse_at(&mut file, abs_offset)?;
-            let nca_size = ncz
-                .sections
-                .iter()
-                .map(|s| s.offset + s.size)
-                .max()
-                .unwrap_or(entry.size);
-            ncz::decompress_ncz(&mut file, &mut tmp, nca_size, abs_offset, entry.size)?;
-            let actual_size = tmp.as_file().metadata()?.len();
-            decompressed_files.push((nca_name, tmp, actual_size));
+            let nca_size = ncz.nca_size(entry.size);
+            ncz_files.push((entry.name.replace(".ncz", ".nca"), abs_offset, entry.size, nca_size));
         } else {
-            passthrough_files.push((entry.name.clone(), nsp.file_abs_offset(entry), entry.size));
+            passthrough_files.push((entry.name.clone(), abs_offset, entry.size));
         }
     }
 
     let mut builder = crate::formats::pfs0::Pfs0Builder::new();
-    for (name, _, size) in &decompressed_files {
+    for (name, _, _, size) in &ncz_files {
         builder.add_file(name.clone(), *size);
     }
     for (name, _, size) in &passthrough_files {
@@ -90,14 +85,26 @@ fn decompress_nsz(input_path: &str, output_path: &str, temp_dir: Option<&Path>) 
 
     let header = builder.build_header();
     let total = builder.total_size();
-    let pb = progress::file_progress(total, "Building NSP");
-    let mut out = BufWriter::new(File::create(output_path)?);
+    let pb = progress::file_progress(total, "Decompressing to NSP");
+    let mut out = BufWriter::with_capacity(OUT_BUFFER, File::create(output_path)?);
     out.write_all(&header)?;
     pb.set_position(header.len() as u64);
 
-    for (_name, mut tmp, size) in decompressed_files {
-        tmp.seek(SeekFrom::Start(0))?;
-        uio::copy_with_progress(&mut tmp, &mut out, size, Some(&pb))?;
+    for (name, abs_offset, compressed_size, nca_size) in &ncz_files {
+        crate::outln!("  Decompressing {}...", name.replace(".nca", ".ncz"));
+        let written = ncz::decompress_ncz_with_progress(
+            &mut file,
+            &mut out,
+            *nca_size,
+            *abs_offset,
+            *compressed_size,
+            Some(&pb),
+        )?;
+        if written != *nca_size {
+            return Err(NscbError::InvalidData(format!(
+                "{name}: decompressed {written} bytes, expected {nca_size}"
+            )));
+        }
     }
     for (_, abs_offset, size) in &passthrough_files {
         uio::copy_section(&mut file, &mut out, *abs_offset, *size, Some(&pb))?;
@@ -109,42 +116,26 @@ fn decompress_nsz(input_path: &str, output_path: &str, temp_dir: Option<&Path>) 
     Ok(())
 }
 
-fn decompress_xcz(input_path: &str, output_path: &str, temp_dir: Option<&Path>) -> Result<()> {
+fn decompress_xcz(input_path: &str, output_path: &str, _temp_dir: Option<&Path>) -> Result<()> {
     crate::outln!("Decompressing XCZ to XCI...");
 
     let mut file = BufReader::new(File::open(input_path)?);
     let xci = Xci::parse(&mut file)?;
     let secure = xci.secure_partition(&mut file)?;
 
-    let total_ncz_bytes: u64 = secure
-        .entries
-        .iter()
-        .filter(|e| e.name.ends_with(".ncz"))
-        .map(|e| e.size)
-        .sum();
-    let decomp_pb = progress::file_progress(total_ncz_bytes, "Decompressing secure NCZ");
-
+    // Sizes and header hashes of decompressed NCAs are known from the NCZ metadata, so
+    // the headers can be written first and each NCZ decompressed straight into place.
     let mut secure_out: Vec<PackedSecureEntry> = Vec::new();
     for entry in &secure.entries {
         let abs_offset = secure.file_abs_offset(entry);
         if entry.name.ends_with(".ncz") {
-            let mut tmp = crate::util::temp::named_file(temp_dir)?;
             let ncz_meta = ncz::NczReader::parse_at(&mut file, abs_offset)?;
-            let nca_size = ncz_meta
-                .sections
-                .iter()
-                .map(|s| s.offset + s.size)
-                .max()
-                .unwrap_or(entry.size);
-            ncz::decompress_ncz(&mut file, &mut tmp, nca_size, abs_offset, entry.size)?;
-            decomp_pb.inc(entry.size);
-            let size = tmp.as_file().metadata()?.len();
-            let hash = hash_first_n_from_temp(&mut tmp, size.min(0x200))?;
+            let nca_size = ncz_meta.nca_size(entry.size);
             secure_out.push(PackedSecureEntry {
                 name: entry.name.replace(".ncz", ".nca"),
-                size,
-                hash,
-                source: EntrySource::Temp(tmp),
+                size: nca_size,
+                hash: ncz_meta.nca_prefix_hash(nca_size.min(0x200) as usize)?,
+                source: EntrySource::Ncz { abs_offset, compressed_size: entry.size, nca_size },
             });
         } else {
             secure_out.push(PackedSecureEntry {
@@ -158,7 +149,6 @@ fn decompress_xcz(input_path: &str, output_path: &str, temp_dir: Option<&Path>) 
             });
         }
     }
-    decomp_pb.finish_with_message("Secure NCZ decompressed");
 
     let mut secure_builder = Hfs0Builder::new();
     for e in &secure_out {
@@ -225,8 +215,8 @@ fn decompress_xcz(input_path: &str, output_path: &str, temp_dir: Option<&Path>) 
     let sig_padding = xci_builder.sig_padding();
     let fake_cert = xci_builder.fake_certificate();
 
-    let pb = progress::file_progress(total_size, "Building XCI");
-    let mut out = BufWriter::new(File::create(output_path)?);
+    let pb = progress::file_progress(total_size, "Decompressing to XCI");
+    let mut out = BufWriter::with_capacity(OUT_BUFFER, File::create(output_path)?);
     out.write_all(&xci_header)?;
     out.write_all(&game_info)?;
     out.write_all(&sig_padding)?;
@@ -245,9 +235,21 @@ fn decompress_xcz(input_path: &str, output_path: &str, temp_dir: Option<&Path>) 
             pb.inc(secure_header.len() as u64);
             for e in &mut secure_out {
                 match &mut e.source {
-                    EntrySource::Temp(tmp) => {
-                        tmp.seek(SeekFrom::Start(0))?;
-                        uio::copy_with_progress(tmp, &mut out, e.size, Some(&pb))?;
+                    EntrySource::Ncz { abs_offset, compressed_size, nca_size } => {
+                        let written = ncz::decompress_ncz_with_progress(
+                            &mut file,
+                            &mut out,
+                            *nca_size,
+                            *abs_offset,
+                            *compressed_size,
+                            Some(&pb),
+                        )?;
+                        if written != *nca_size {
+                            return Err(NscbError::InvalidData(format!(
+                                "{}: decompressed {written} bytes, expected {nca_size}",
+                                e.name
+                            )));
+                        }
                     }
                     EntrySource::Input { abs_offset, size } => {
                         let copied = uio::copy_section_tolerant(
@@ -321,13 +323,3 @@ fn hash_first_n_from_reader<R: Read + Seek>(
     Ok(hash::sha256(&buf))
 }
 
-fn hash_first_n_from_temp(tmp: &mut tempfile::NamedTempFile, n: u64) -> Result<[u8; 32]> {
-    if n == 0 {
-        return Ok(hash::sha256(&[]));
-    }
-    let f = tmp.as_file_mut();
-    f.seek(SeekFrom::Start(0))?;
-    let mut buf = vec![0u8; n as usize];
-    f.read_exact(&mut buf)?;
-    Ok(hash::sha256(&buf))
-}

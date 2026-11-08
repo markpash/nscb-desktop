@@ -30,6 +30,150 @@ pub fn file_list(path: &str, ks: &KeyStore) -> Result<()> {
     Ok(())
 }
 
+/// Kind of title in a container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TitleKind {
+    Base,
+    Update,
+    Dlc,
+    Other,
+}
+
+/// Kind of NCA content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentKind {
+    Meta,
+    Program,
+    Data,
+    Control,
+    HtmlDocument,
+    LegalInformation,
+    DeltaFragment,
+}
+
+impl ContentKind {
+    fn from_ncatype(ncatype: u8) -> Self {
+        match ncatype {
+            0 => ContentKind::Meta,
+            1 => ContentKind::Program,
+            3 => ContentKind::Control,
+            4 => ContentKind::HtmlDocument,
+            5 => ContentKind::LegalInformation,
+            6 => ContentKind::DeltaFragment,
+            _ => ContentKind::Data,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ContentKind::Meta => "Meta",
+            ContentKind::Program => "Program",
+            ContentKind::Data => "Data",
+            ContentKind::Control => "Control",
+            ContentKind::HtmlDocument => "HtmlDoc",
+            ContentKind::LegalInformation => "LegalInf",
+            ContentKind::DeltaFragment => "Delta",
+        }
+    }
+}
+
+/// One NCA listed by a title's metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentInfo {
+    pub name: String,
+    pub size: u64,
+    pub kind: ContentKind,
+}
+
+/// Metadata for one title (base game, update or DLC) in a container.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TitleInfo {
+    /// Uppercase 16-hex title ID.
+    pub title_id: String,
+    pub base_title_id: String,
+    pub kind: TitleKind,
+    pub version: u32,
+    /// DLC number (DLC titles only).
+    pub dlc_number: Option<u64>,
+    pub name: String,
+    pub publisher: String,
+    pub display_version: String,
+    pub languages: Vec<String>,
+    pub meta_sdk_version: String,
+    /// Program SDK version (Data SDK version for DLC).
+    pub content_sdk_version: String,
+    /// Required system version; for DLC, the required application version.
+    pub required_system_version: u32,
+    /// Firmware for `required_system_version`, e.g. `9.0.0` (not set for DLC).
+    pub required_firmware: Option<String>,
+    pub key_generation: u8,
+    /// Firmware range for `key_generation`, e.g. `9.1.0 - 12.0.3`.
+    pub key_generation_firmware: String,
+    /// Lowest RequiredSystemVersion this title can be patched to (not set for DLC).
+    pub patchable_to: Option<(u32, String)>,
+    /// Non-delta contents plus the meta NCA.
+    pub contents: Vec<ContentInfo>,
+    pub total_size: u64,
+}
+
+/// Everything `inspect` found in a container.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerInfo {
+    pub titles: Vec<TitleInfo>,
+}
+
+fn strip_parens(s: &str) -> String {
+    s.trim_start_matches('(').trim_end_matches(')').to_string()
+}
+
+/// Read title metadata from an NSP/NSZ/XCI/XCZ.
+pub fn inspect(path: &str, ks: &KeyStore) -> Result<ContainerInfo> {
+    let report = build_report(path, ks)?;
+    let titles = report
+        .titles
+        .iter()
+        .map(|t| {
+            let kind = match t.title_type {
+                TitleType::Application => TitleKind::Base,
+                TitleType::Patch => TitleKind::Update,
+                TitleType::AddOnContent => TitleKind::Dlc,
+                _ => TitleKind::Other,
+            };
+            let is_dlc = kind == TitleKind::Dlc;
+            let mut contents: Vec<ContentInfo> = t
+                .content_entries
+                .iter()
+                .filter(|e| e.ncatype != 6)
+                .map(|e| ContentInfo { name: e.name.clone(), size: e.size, kind: ContentKind::from_ncatype(e.ncatype) })
+                .collect();
+            contents.push(ContentInfo { name: t.meta_name.clone(), size: t.meta_size, kind: ContentKind::Meta });
+            let total_size = contents.iter().map(|c| c.size).sum();
+            let min_rsv = python_min_rsv(t.key_generation, t.required_system_version);
+            TitleInfo {
+                title_id: format!("{:016X}", t.title_id),
+                base_title_id: format!("{:016X}", t.base_id),
+                kind,
+                version: t.version,
+                dlc_number: is_dlc.then(|| dlc_number(t.title_id)),
+                name: python_spacing(&t.control.title),
+                publisher: t.control.publisher.clone(),
+                display_version: t.control.display_version.clone(),
+                languages: t.control.languages.iter().map(|l| l.to_string()).collect(),
+                meta_sdk_version: t.meta_sdk_version.clone(),
+                content_sdk_version: t.content_sdk_version.clone(),
+                required_system_version: t.required_system_version,
+                required_firmware: (!is_dlc).then(|| strip_parens(&python_fw_range_rsv(t.required_system_version))),
+                key_generation: t.key_generation,
+                key_generation_firmware: strip_parens(python_fw_range_kg(t.key_generation)),
+                patchable_to: (!is_dlc).then(|| (min_rsv, strip_parens(&python_fw_range_rsv(min_rsv)))),
+                contents,
+                total_size,
+            }
+        })
+        .collect();
+    Ok(ContainerInfo { titles })
+}
+
 pub(crate) fn control_language_tag(path: &str, ks: &KeyStore) -> Option<String> {
     let report = build_report(path, ks).ok()?;
     let title = report

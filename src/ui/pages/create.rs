@@ -1,6 +1,8 @@
 //! Create / Repack: rebuild an NSP from a split NCA folder.
 
-use crate::core::args::{basename, Op, RunOptions};
+use crate::jobs::{Job, JobKind};
+use crate::ui::job_view::JobView;
+use std::path::PathBuf;
 use crate::runner::{Runner, RunnerEvent, Source};
 use crate::ui::icons::AppIcon;
 use crate::ui::theme::{self, hex, Accent};
@@ -15,7 +17,7 @@ pub struct CreatePage {
     runner: Entity<Runner>,
     input_folder: Entity<InputState>,
     output: Entity<InputState>,
-    run: RunView,
+    job: JobView,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -25,7 +27,7 @@ impl CreatePage {
         let subscriptions = vec![
             cx.subscribe(&runner, |this, _, event: &RunnerEvent, cx| {
                 if event.source() == Source::Create {
-                    this.run.apply(event);
+                    this.job.apply(event);
                     cx.notify();
                 }
             }),
@@ -39,7 +41,7 @@ impl CreatePage {
             runner,
             input_folder,
             output: text_input("Default: same as source file", "", window, cx),
-            run: RunView::default(),
+            job: JobView::default(),
             _subscriptions: subscriptions,
         }
     }
@@ -50,25 +52,26 @@ impl CreatePage {
 
     fn start(&mut self, cx: &mut Context<Self>) {
         let folder = self.folder(cx);
-        if folder.is_empty() {
+        if folder.is_empty() || self.job.running {
             return;
         }
-        self.run.start("Starting repack...");
         let output = input_value(&self.output, cx);
-        let options = RunOptions { output: (!output.is_empty()).then_some(output), ..Default::default() };
-        self.runner.update(cx, |r, cx| r.run(Source::Create, Op::Create, vec![folder], options, cx)).detach();
+        let job = Job::new(JobKind::Create, vec![PathBuf::from(&folder)])
+            .with_out_dir((!output.trim().is_empty()).then(|| PathBuf::from(output.trim())));
+        self.job.start(job.kind.verb(), vec![basename(&folder).to_string()]);
+        self.runner.update(cx, |r, cx| r.run(Source::Create, job, cx)).detach();
         cx.notify();
     }
 
     fn cancel(&mut self, cx: &mut Context<Self>) {
         self.runner.update(cx, |r, _| r.cancel());
-        self.run.cancelled();
+        self.job.cancel();
         cx.notify();
     }
 
     fn clear(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         set_input(&self.input_folder, "", window, cx);
-        self.run.clear();
+        self.job.clear();
         cx.notify();
     }
 }
@@ -119,9 +122,9 @@ impl Render for CreatePage {
             ))
             .when(!folder.is_empty(), |this| {
                 this.child(output_dir_picker("browse-output", &self.output, cx, |p: &Self| &p.output))
-                    .children(self.run.render("progress", cx))
+                    .children(self.job.status_panel("status", true))
                     .child(action_bar(
-                        self.run.running,
+                        self.job.running,
                         "Start Repack",
                         false,
                         cx.listener(|this, _: &ClickEvent, _, cx| this.cancel(cx)),

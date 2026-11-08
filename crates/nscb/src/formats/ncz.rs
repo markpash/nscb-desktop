@@ -12,7 +12,7 @@
 
 use std::io::{Read, Seek, SeekFrom, Write};
 
-use aes::cipher::{BlockEncrypt, KeyInit};
+use aes::cipher::KeyInit;
 use aes::Aes128;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use indicatif::ProgressBar;
@@ -200,17 +200,130 @@ impl NczReader {
 
 /// Decompress an NCZ file to NCA.
 /// `offset` is where the NCZ data starts in the reader.
-pub fn decompress_ncz<R: Read + Seek, W: Read + Write + Seek>(
+impl NczReader {
+    /// Size of the decompressed NCA: the end of the last section, at least the header.
+    pub fn nca_size(&self, fallback: u64) -> u64 {
+        let end = self.sections.iter().map(|s| s.offset + s.size).max().unwrap_or(fallback);
+        end.max(self.nca_header.len() as u64)
+    }
+
+    /// SHA-256 of the first `n` bytes of the decompressed NCA (as stored in HFS0 headers),
+    /// computable before decompressing.
+    pub fn nca_prefix_hash(&self, n: usize) -> Result<[u8; 32]> {
+        let n = n.min(self.nca_header.len());
+        let mut prefix = self.nca_header[..n].to_vec();
+        for (start, end, cipher, nonce) in crypt_ranges(&self.sections)? {
+            apply_range(&mut prefix, 0, start, end, &cipher, &nonce);
+        }
+        Ok(crate::crypto::hash::sha256(&prefix))
+    }
+}
+
+/// AES-CTR ranges to re-apply after decompression (crypto types 3 and 4), matching
+/// NSC_BUILDER: types 0 and 1 are left as-is.
+fn crypt_ranges(sections: &[NczSection]) -> Result<Vec<(u64, u64, Aes128, [u8; 8])>> {
+    let mut ranges = Vec::new();
+    for s in sections {
+        match s.crypto_type {
+            0 | 1 => {}
+            3 | 4 => {
+                let cipher = Aes128::new_from_slice(&s.crypto_key)
+                    .map_err(|e| NscbError::Crypto(format!("AES key init: {e}")))?;
+                let mut nonce = [0u8; 8];
+                nonce.copy_from_slice(&s.crypto_counter[..8]);
+                ranges.push((s.offset, s.offset.saturating_add(s.size), cipher, nonce));
+            }
+            other => {
+                return Err(NscbError::InvalidData(format!(
+                    "Unsupported NCZ section crypto type {other}"
+                )))
+            }
+        }
+    }
+    Ok(ranges)
+}
+
+/// Apply the CTR transform for `[start, end)` to the part of `data` (which begins at
+/// absolute offset `pos`) that overlaps it.
+fn apply_range(data: &mut [u8], pos: u64, start: u64, end: u64, cipher: &Aes128, nonce: &[u8; 8]) {
+    let lo = start.max(pos);
+    let hi = end.min(pos + data.len() as u64);
+    if lo < hi {
+        let a = (lo - pos) as usize;
+        let b = (hi - pos) as usize;
+        aes_ctr_transform_in_place(cipher, nonce, lo, &mut data[a..b]);
+    }
+}
+
+/// Writer that re-encrypts NCZ sections as decompressed bytes pass through, tracking the
+/// absolute NCA offset, and advances an optional progress bar.
+struct SectionCryptWriter<'a, W: Write> {
+    inner: &'a mut W,
+    pos: u64,
+    ranges: Vec<(u64, u64, Aes128, [u8; 8])>,
+    scratch: Vec<u8>,
+    pb: Option<&'a ProgressBar>,
+}
+
+impl<W: Write> Write for SectionCryptWriter<'_, W> {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let end = self.pos + data.len() as u64;
+        let overlaps = self.ranges.iter().any(|(s, e, _, _)| *s < end && *e > self.pos);
+        if overlaps {
+            self.scratch.clear();
+            self.scratch.extend_from_slice(data);
+            for (start, stop, cipher, nonce) in &self.ranges {
+                apply_range(&mut self.scratch, self.pos, *start, *stop, cipher, nonce);
+            }
+            self.inner.write_all(&self.scratch)?;
+        } else {
+            self.inner.write_all(data)?;
+        }
+        self.pos = end;
+        if let Some(pb) = self.pb {
+            pb.inc(data.len() as u64);
+        }
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Decompress an NCZ into `writer` as the original NCA, in a single pass.
+pub fn decompress_ncz<R: Read + Seek, W: Write>(
     reader: &mut R,
     writer: &mut W,
     total_nca_size: u64,
     offset: u64,
     compressed_size: u64,
 ) -> Result<()> {
+    decompress_ncz_with_progress(reader, writer, total_nca_size, offset, compressed_size, None).map(|_| ())
+}
+
+/// Like [`decompress_ncz`], advancing `pb` by output bytes. Returns the bytes written.
+pub fn decompress_ncz_with_progress<R: Read + Seek, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    total_nca_size: u64,
+    offset: u64,
+    compressed_size: u64,
+    pb: Option<&ProgressBar>,
+) -> Result<u64> {
     let ncz = NczReader::parse_at(reader, offset)?;
+    // Sections are re-encrypted on the way out (cryptoType 3/4 AES-CTR), matching
+    // NSC_BUILDER's in-place transform of the decompressed payload.
+    let mut out = SectionCryptWriter {
+        inner: writer,
+        pos: 0,
+        ranges: crypt_ranges(&ncz.sections)?,
+        scratch: Vec::new(),
+        pb,
+    };
 
     // Write the original NCA header
-    writer.write_all(&ncz.nca_header)?;
+    out.write_all(&ncz.nca_header)?;
 
     // Seek to compressed data
     reader.seek(SeekFrom::Start(ncz.data_start))?;
@@ -222,13 +335,13 @@ pub fn decompress_ncz<R: Read + Seek, W: Read + Write + Seek>(
 
     if ncz.is_stream {
         // Stream-based: decompress a single zstd stream
-        decompress_stream(&mut limited, writer, &mut written, target)?;
+        decompress_stream(&mut limited, &mut out, &mut written, target)?;
     } else if let Some(block_table) = &ncz.block_table {
         // Block-based: decompress individual blocks
         let block_size = 1usize << block_table.block_size_exponent;
         decompress_blocks(
             &mut limited,
-            writer,
+            &mut out,
             block_table,
             block_size,
             &mut written,
@@ -242,71 +355,15 @@ pub fn decompress_ncz<R: Read + Seek, W: Read + Write + Seek>(
 
     // Pad to target size if needed
     if written < target {
-        crate::util::io::write_padding(writer, target - written)?;
+        crate::util::io::write_padding(&mut out, target - written)?;
+        written = target;
     }
-
-    // Match NSC_BUILDER: NCZ payload is then transformed in-place per section.
-    // cryptoType 1: plaintext (no-op), cryptoType 3: AES-CTR transform.
-    reencrypt_sections_in_place(writer, &ncz.sections)?;
-
-    Ok(())
-}
-
-fn reencrypt_sections_in_place<W: Read + Write + Seek>(
-    writer: &mut W,
-    sections: &[NczSection],
-) -> Result<()> {
-    let mut buf = vec![0u8; 0x10000];
-    for s in sections {
-        // Match python behavior:
-        // - 0 and 1 mean no post-transform for this section
-        // - 3/4 mean AES-CTR transform
-        if s.crypto_type == 0 || s.crypto_type == 1 {
-            continue;
-        }
-        if s.crypto_type != 3 && s.crypto_type != 4 {
-            return Err(NscbError::InvalidData(format!(
-                "Unsupported NCZ section crypto type {}",
-                s.crypto_type
-            )));
-        }
-
-        let cipher = Aes128::new_from_slice(&s.crypto_key)
-            .map_err(|e| NscbError::Crypto(format!("AES key init: {e}")))?;
-        let mut pos = s.offset;
-        let end = s.offset.saturating_add(s.size);
-        while pos < end {
-            crate::util::report::check_cancelled()?;
-            let chunk_sz = (end - pos).min(buf.len() as u64) as usize;
-            writer.seek(SeekFrom::Start(pos))?;
-            writer.read_exact(&mut buf[..chunk_sz])?;
-            aes_ctr_transform_in_place(&cipher, &s.crypto_counter[..8], pos, &mut buf[..chunk_sz]);
-            writer.seek(SeekFrom::Start(pos))?;
-            writer.write_all(&buf[..chunk_sz])?;
-            pos += chunk_sz as u64;
-        }
-    }
-    Ok(())
+    out.flush()?;
+    Ok(written)
 }
 
 fn aes_ctr_transform_in_place(cipher: &Aes128, nonce8: &[u8], file_offset: u64, data: &mut [u8]) {
-    let mut cached_block_index = u64::MAX;
-    let mut cached_keystream = [0u8; 16];
-    for (i, byte) in data.iter_mut().enumerate() {
-        let abs = file_offset + i as u64;
-        let block_index = abs / 16;
-        let byte_in_block = (abs % 16) as usize;
-        if block_index != cached_block_index {
-            let mut ctr = [0u8; 16];
-            ctr[..8].copy_from_slice(nonce8);
-            ctr[8..].copy_from_slice(&block_index.to_be_bytes());
-            let mut blk = aes::Block::from(ctr);
-            cipher.encrypt_block(&mut blk);
-            cached_keystream.copy_from_slice(&blk);
-            cached_block_index = block_index;
-        }
-        *byte ^= cached_keystream[byte_in_block];
-    }
+    crate::crypto::aes_ctr::ctr64be_xor(cipher, nonce8, file_offset, data);
 }
 
 /// Decompress a stream-based NCZ (single zstd stream).
@@ -428,6 +485,12 @@ pub fn compress_nca<R: Read + Seek, W: Write + Seek>(
     if nca_size > 0x4000 {
         let mut enc = zstd::stream::write::Encoder::new(writer, compression_level)
             .map_err(|e| NscbError::Crypto(format!("zstd encoder init error: {e}")))?;
+        // Compress on all cores. The output is still a single standard zstd frame.
+        let workers = std::thread::available_parallelism().map_or(1, |n| n.get() as u32);
+        if workers > 1 {
+            enc.multithread(workers)
+                .map_err(|e| NscbError::Crypto(format!("zstd multithread setup error: {e}")))?;
+        }
         let mut pos = 0x4000u64;
         for s in &out_sections {
             if s.offset > pos {

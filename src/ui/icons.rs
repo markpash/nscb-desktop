@@ -35,6 +35,7 @@ app_icons! {
     File => "file",
     Folder => "folder",
     X => "x",
+    Check => "check",
     AlertCircle => "alert-circle",
     Play => "play",
     Key => "key",

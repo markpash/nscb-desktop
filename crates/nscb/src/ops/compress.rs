@@ -3,7 +3,7 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-use aes::cipher::{BlockEncrypt, KeyInit};
+use aes::cipher::KeyInit;
 use aes::Aes128;
 
 use crate::crypto::hash;
@@ -640,23 +640,7 @@ fn read_u64<R: Read>(r: &mut R) -> Result<u64> {
 }
 
 fn aes_ctr_transform_in_place(cipher: &Aes128, nonce8: &[u8], file_offset: u64, data: &mut [u8]) {
-    let mut cached_block_index = u64::MAX;
-    let mut cached_keystream = [0u8; 16];
-    for (i, byte) in data.iter_mut().enumerate() {
-        let abs = file_offset + i as u64;
-        let block_index = abs / 16;
-        let byte_in_block = (abs % 16) as usize;
-        if block_index != cached_block_index {
-            let mut ctr = [0u8; 16];
-            ctr[..8].copy_from_slice(nonce8);
-            ctr[8..].copy_from_slice(&block_index.to_be_bytes());
-            let mut blk = aes::Block::from(ctr);
-            cipher.encrypt_block(&mut blk);
-            cached_keystream.copy_from_slice(&blk);
-            cached_block_index = block_index;
-        }
-        *byte ^= cached_keystream[byte_in_block];
-    }
+    crate::crypto::aes_ctr::ctr64be_xor(cipher, nonce8, file_offset, data);
 }
 
 fn hash_first_n_from_reader<R: Read + Seek>(

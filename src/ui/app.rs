@@ -20,7 +20,6 @@ use gpui_kit::component::notification::Notification;
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::{h_flex, v_flex, Disableable, Sizable, WindowExt};
 use gpui_kit::prelude::*;
-use gpui_kit::TestSupportExt;
 use gpui_kit::{
     div, px, AnyView, ClickEvent, Context, FontWeight, IntoElement, SharedString, Subscription, Window,
 };
@@ -107,8 +106,11 @@ impl NscbApp {
         let subscriptions = vec![
             // Every backend error is also surfaced as a toast.
             cx.subscribe_in(&runner, window, |_, _, event: &RunnerEvent, window, cx| {
-                if let RunnerEvent::Error { message, .. } = event {
-                    window.push_notification(Notification::error(message.clone()), cx);
+                match event {
+                    RunnerEvent::StepFinished { result: Err(message), .. } | RunnerEvent::Rejected { message, .. } => {
+                        window.push_notification(Notification::error(message.clone()), cx);
+                    }
+                    _ => {}
                 }
             }),
         ];
@@ -323,7 +325,6 @@ impl NscbApp {
                             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.navigate(id, cx)))
                             .child(icon_sized(icon, 18.))
                             .child(label)
-                            .test_support()
                     })),
             )
             .child(

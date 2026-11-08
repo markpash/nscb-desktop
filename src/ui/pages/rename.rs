@@ -1,8 +1,10 @@
 //! Rename: rename files/folders from metadata + NUTDB, plus NUTDB refresh/lookup.
 //! The Basic and Advanced tabs edit the same rename state.
 
-use crate::core::args::{Op, RunOptions};
-use crate::core::tools::{DEFAULT_NUTDB_URL, SETTING_NUTDB_URL, SETTING_PROXY};
+use crate::jobs::{Job, JobKind};
+use crate::ui::job_view::{nutdb_results, rename_results, JobView};
+use nscb::api::{DlcRenameMode, NoVersionMode, RenameMode, RenameOptions};
+use std::path::PathBuf;
 use crate::runner::{Runner, RunnerEvent, Source};
 use crate::ui::icons::AppIcon;
 use crate::ui::theme::{self, hex, hexa, Accent};
@@ -43,7 +45,9 @@ fn renmode_description(v: &str) -> &'static str {
 pub struct RenamePage {
     runner: Entity<Runner>,
     files: Vec<String>,
-    run: RunView,
+    job: JobView,
+    /// Whether the current/last job renamed files (vs. a NUTDB operation).
+    job_is_rename: bool,
     advanced: bool,
 
     renmode: &'static str,
@@ -83,7 +87,7 @@ impl RenamePage {
         let subscriptions = vec![
             cx.subscribe(&runner, |this, _, event: &RunnerEvent, cx| {
                 if event.source() == Source::Rename {
-                    this.run.apply(event);
+                    this.job.apply(event);
                     cx.notify();
                 }
             }),
@@ -123,7 +127,8 @@ impl RenamePage {
         Self {
             runner,
             files: Vec::new(),
-            run: RunView::default(),
+            job: JobView::default(),
+            job_is_rename: false,
             advanced: false,
             renmode: "force",
             addlangue: "false",
@@ -172,41 +177,57 @@ impl RenamePage {
     }
 
     fn remove_file(&mut self, index: usize, _: &mut Window, cx: &mut Context<Self>) {
-        if index < self.files.len() {
+        if index < self.files.len() && !self.job.running {
             self.files.remove(index);
+            if self.job_is_rename {
+                self.job.clear();
+            }
             cx.notify();
         }
     }
 
-    fn launch(&mut self, op: Op, files: Vec<String>, options: RunOptions, message: String, cx: &mut Context<Self>) {
-        self.run.start(message);
-        self.runner.update(cx, |r, cx| r.run(Source::Rename, op, files, options, cx)).detach();
+    fn launch(&mut self, job: Job, labels: Vec<String>, cx: &mut Context<Self>) {
+        if self.job.running {
+            return;
+        }
+        self.job_is_rename = matches!(job.kind, JobKind::Rename(_));
+        self.job.start(job.kind.verb(), labels);
+        self.runner.update(cx, |r, cx| r.run(Source::Rename, job, cx)).detach();
         cx.notify();
+    }
+
+    fn rename_options(&self) -> RenameOptions {
+        RenameOptions {
+            mode: match self.renmode {
+                "force" => RenameMode::Force,
+                "skip_if_tid" => RenameMode::SkipIfTid,
+                _ => RenameMode::SkipCorrectTid,
+            },
+            add_language: self.addlangue == "true",
+            no_version: match self.noversion {
+                "true" => NoVersionMode::Omit,
+                "xci_no_v0" => NoVersionMode::XciNoV0,
+                _ => NoVersionMode::Keep,
+            },
+            dlc_mode: match self.dlcrname {
+                "true" => DlcRenameMode::PreferControlTitle,
+                "tag" => DlcRenameMode::AppendTag,
+                _ => DlcRenameMode::KeepBaseStyle,
+            },
+        }
     }
 
     fn start(&mut self, cx: &mut Context<Self>) {
         if self.files.is_empty() {
             return;
         }
-        let options = RunOptions {
-            renmode: Some(self.renmode.into()),
-            addlangue: Some(self.addlangue.into()),
-            noversion: Some(self.noversion.into()),
-            dlcrname: Some(self.dlcrname.into()),
-            ..Default::default()
-        };
-        self.launch(Op::Renamef, self.files.clone(), options, "Renaming files...".into(), cx);
+        let job = Job::new(JobKind::Rename(self.rename_options()), self.files.iter().map(PathBuf::from).collect());
+        let labels = self.files.iter().map(|f| basename(f).to_string()).collect();
+        self.launch(job, labels, cx);
     }
 
     fn nutdb_refresh(&mut self, cx: &mut Context<Self>) {
-        let tools = self.runner.read(cx).tools().clone();
-        let proxy = tools.setting(SETTING_PROXY);
-        let mut url = tools.setting(SETTING_NUTDB_URL);
-        if url.is_empty() {
-            url = DEFAULT_NUTDB_URL.into();
-        }
-        let options = RunOptions { nutdb_url: Some(format!("{proxy}{url}")), ..Default::default() };
-        self.launch(Op::NutdbRefresh, Vec::new(), options, "Refreshing NUTDB cache...".into(), cx);
+        self.launch(Job::new(JobKind::NutdbRefresh, Vec::new()), vec!["NUTDB".into()], cx);
     }
 
     fn nutdb_lookup(&mut self, cx: &mut Context<Self>) {
@@ -214,20 +235,18 @@ impl RenamePage {
         if title_id.is_empty() {
             return;
         }
-        let message = format!("Looking up {title_id}...");
-        let options = RunOptions { title_id: Some(title_id), ..Default::default() };
-        self.launch(Op::NutdbLookup, Vec::new(), options, message, cx);
+        self.launch(Job::new(JobKind::NutdbLookup(title_id.clone()), Vec::new()), vec![title_id], cx);
     }
 
     fn cancel(&mut self, cx: &mut Context<Self>) {
         self.runner.update(cx, |r, _| r.cancel());
-        self.run.cancelled();
+        self.job.cancel();
         cx.notify();
     }
 
     fn clear(&mut self, cx: &mut Context<Self>) {
         self.files.clear();
-        self.run.clear();
+        self.job.clear();
         cx.notify();
     }
 
@@ -406,6 +425,12 @@ impl RenamePage {
 
 impl FileTarget for RenamePage {
     fn add_files(&mut self, files: Vec<String>, _: &mut Window, cx: &mut Context<Self>) {
+        if self.job.running {
+            return;
+        }
+        if self.job_is_rename {
+            self.job.clear();
+        }
         add_unique(&mut self.files, files);
         cx.notify();
     }
@@ -413,7 +438,8 @@ impl FileTarget for RenamePage {
 
 impl Render for RenamePage {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let running = self.run.running;
+        let running = self.job.running;
+        let rename_job = self.job_is_rename.then_some(&self.job);
         let title_id_empty = input_value(&self.title_id, cx).trim().is_empty();
         let tabs = TabBar::new("rename-tabs")
             .small()
@@ -434,7 +460,7 @@ impl Render for RenamePage {
                     .gap(px(12.))
                     .p(px(12.))
                     .child(drop_zone("drop-zone", DROP, cx))
-                    .children(file_list("files", &self.files, cx, Self::remove_file)),
+                    .children(file_list("files", &self.files, rename_job, cx, Self::remove_file)),
             ))
             .child(card("Rename Options", Some(tabs.into_any_element()), options_body))
             .child(card(
@@ -462,7 +488,7 @@ impl Render for RenamePage {
                         Some("Look up a title ID in the NUTDB database".into()),
                     )),
             ))
-            .children(self.run.render("progress", cx))
+            .children(self.job.status_panel("status", !self.job_is_rename))
             .child(action_bar(
                 running,
                 SharedString::from("Start Rename"),
@@ -471,5 +497,12 @@ impl Render for RenamePage {
                 cx.listener(|this, _: &ClickEvent, _, cx| this.clear(cx)),
                 cx.listener(|this, _: &ClickEvent, _, cx| this.start(cx)),
             ))
+            .map(|this| {
+                if self.job_is_rename {
+                    this.children(rename_results(&self.job))
+                } else {
+                    this.children(nutdb_results(&self.job))
+                }
+            })
     }
 }

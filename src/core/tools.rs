@@ -1,4 +1,4 @@
-//! The tools directory: encryption keys, settings and verify scratch files.
+//! The tools directory: encryption keys and settings.
 //!
 //! Everything lives in `<os temp dir>/nscb-desktop-tools`, the same location the
 //! previous Tauri build used, so existing installs keep their keys and settings.
@@ -48,29 +48,6 @@ impl Tools {
     pub fn import_keys(&self, src: &Path) -> Result<(), String> {
         fs::copy(src, self.keys_path()).map_err(|e| format!("Failed to copy prod.keys: {e}"))?;
         Ok(())
-    }
-
-    /// Write a one-line file list for `--verify all --text_file` (non-interactive verify)
-    /// and remove any cached result so the backend runs fresh.
-    pub fn create_verify_filelist(&self, target: &str) -> Result<PathBuf, String> {
-        let stem = Path::new(target)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("verify");
-        let safe: String = stem
-            .chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
-            .collect();
-        let list_path = self.dir.join(format!("{safe}-vflist.txt"));
-        let cached = self
-            .dir
-            .join("INFO")
-            .join("MASSVERIFY")
-            .join(format!("{safe}-vflist-verify.txt"));
-        let _ = fs::remove_file(cached);
-        fs::write(&list_path, format!("{target}\n"))
-            .map_err(|e| format!("Failed to create verify filelist: {e}"))?;
-        Ok(list_path)
     }
 
     // ---- settings ----
@@ -135,15 +112,6 @@ mod tests {
         assert!(!tools.has_keys());
         fs::write(tools.dir().join("keys.txt"), "x").unwrap();
         assert!(tools.has_keys());
-        let _ = fs::remove_dir_all(tools.dir());
-    }
-
-    #[test]
-    fn verify_filelist_sanitizes_name_and_contains_target() {
-        let tools = temp_tools("verify");
-        let path = tools.create_verify_filelist("/games/My Game [v0].nsp").unwrap();
-        assert_eq!(path.file_name().unwrap(), "My_Game__v0_-vflist.txt");
-        assert_eq!(fs::read_to_string(&path).unwrap(), "/games/My Game [v0].nsp\n");
         let _ = fs::remove_dir_all(tools.dir());
     }
 }

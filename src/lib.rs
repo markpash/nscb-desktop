@@ -2,6 +2,7 @@
 
 pub mod core;
 pub mod engine;
+pub mod jobs;
 pub mod runner;
 pub mod ui;
 

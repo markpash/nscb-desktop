@@ -5,6 +5,19 @@ use aes::Aes128;
 
 use crate::error::{NscbError, Result};
 
+/// XOR `data` with the AES-128-CTR keystream at `file_offset`, using the Switch NCA
+/// counter layout: 8-byte nonce followed by a 64-bit big-endian block counter
+/// (`file_offset / 16`). Processes whole blocks in bulk.
+pub fn ctr64be_xor(cipher: &Aes128, nonce8: &[u8], file_offset: u64, data: &mut [u8]) {
+    use ctr::cipher::{InnerIvInit, StreamCipher, StreamCipherSeek};
+    let mut iv = [0u8; 16];
+    iv[..8].copy_from_slice(&nonce8[..8]);
+    let core = ctr::CtrCore::<Aes128, ctr::flavors::Ctr64BE>::inner_iv_init(cipher.clone(), &iv.into());
+    let mut stream = ctr::Ctr64BE::<Aes128>::from_core(core);
+    stream.seek(file_offset);
+    stream.apply_keystream(data);
+}
+
 /// Seekable AES-128-CTR reader that decrypts on the fly.
 ///
 /// Nintendo Switch NCA sections use AES-CTR with an 8-byte nonce
@@ -288,4 +301,26 @@ mod tests {
 
         assert_eq!(&combined[..], &buf_full[..]);
     }
+
+    #[test]
+    fn ctr64be_xor_matches_per_byte_reference() {
+        let cipher = Aes128::new_from_slice(&[0x42; 16]).unwrap();
+        let nonce = [9u8, 8, 7, 6, 5, 4, 3, 2];
+        for (offset, len) in [(0u64, 64usize), (5, 37), (0x4000 + 3, 1000), (u32::MAX as u64 * 16 + 7, 50)] {
+            let mut fast = (0..len).map(|i| i as u8).collect::<Vec<_>>();
+            let mut slow = fast.clone();
+            ctr64be_xor(&cipher, &nonce, offset, &mut fast);
+            for (i, byte) in slow.iter_mut().enumerate() {
+                let abs = offset + i as u64;
+                let mut ctr = [0u8; 16];
+                ctr[..8].copy_from_slice(&nonce);
+                ctr[8..].copy_from_slice(&(abs / 16).to_be_bytes());
+                let mut blk = aes::Block::from(ctr);
+                cipher.encrypt_block(&mut blk);
+                *byte ^= blk[(abs % 16) as usize];
+            }
+            assert_eq!(fast, slow, "offset {offset} len {len}");
+        }
+    }
+
 }

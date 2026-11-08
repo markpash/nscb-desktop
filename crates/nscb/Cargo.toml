@@ -10,9 +10,12 @@ clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 byteorder = "1"
 aes = "0.8"
-sha2 = "0.10"
+ctr = "0.9"
+sha2 = "0.11"
+# rsa 0.9 PSS verification is built on sha2 0.10's digest traits.
+sha2_rsa = { package = "sha2", version = "0.10" }
 hex = "0.4"
-zstd = "0.13"
+zstd = { version = "0.13", features = ["zstdmt"] }
 indicatif = "0.17"
 tempfile = "3"
 log = "0.4"

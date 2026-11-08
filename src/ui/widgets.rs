@@ -1,20 +1,17 @@
 //! Shared building blocks: page header, cards, option groups, drop zone, file list,
-//! output directory picker, progress console and action bar.
+//! output directory picker and action bar.
 
 use super::icons::AppIcon;
 use super::theme::{self, hex, hexa, Accent};
-use crate::core::args::basename;
-use crate::runner::RunnerEvent;
+use super::job_view::{item_detail, item_status_badge, JobView};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputState};
-use gpui_kit::component::progress::Progress;
 use gpui_kit::component::select::{Select, SelectItem, SelectState};
-use gpui_kit::component::{h_flex, v_flex, ActiveTheme, Disableable, Icon, IndexPath, Sizable};
+use gpui_kit::component::{h_flex, v_flex, Disableable, Icon, IndexPath, Sizable};
 use gpui_kit::prelude::*;
-use gpui_kit::TestSupportExt;
 use gpui_kit::{
     div, px, AnyElement, App, ClickEvent, Context, Entity, ExternalPaths, FontWeight, IntoElement,
-    PathPromptOptions, ScrollHandle, SharedString, Window,
+    PathPromptOptions, SharedString, Window,
 };
 use std::path::PathBuf;
 
@@ -23,6 +20,11 @@ pub const DROP_GROUP: &str = "page-drop";
 // ---------------------------------------------------------------------------
 // Paths
 // ---------------------------------------------------------------------------
+
+/// Last path component, accepting both `/` and `\\` separators.
+pub fn basename(path: &str) -> &str {
+    path.rsplit(['/', '\\']).next().unwrap_or(path)
+}
 
 pub fn path_string(p: &PathBuf) -> String {
     p.to_string_lossy().into_owned()
@@ -313,7 +315,6 @@ pub fn drop_zone<T: FileTarget>(id: &'static str, spec: DropSpec, cx: &mut Conte
                 .mt(px(4.))
                 .children(spec.accept.iter().map(|ext| ext_badge(&ext.to_uppercase()))),
         )
-        .test_support()
 }
 
 pub fn add_unique(files: &mut Vec<String>, new_files: Vec<String>) {
@@ -324,9 +325,12 @@ pub fn add_unique(files: &mut Vec<String>, new_files: Vec<String>) {
     }
 }
 
+/// The selected files. While or after a job runs, each row also shows that file's
+/// status, progress and result (`job` items correspond to `files` by index).
 pub fn file_list<T: 'static>(
     id: &'static str,
     files: &[String],
+    job: Option<&JobView>,
     cx: &mut Context<T>,
     on_remove: impl Fn(&mut T, usize, &mut Window, &mut Context<T>) + Copy + 'static,
 ) -> Option<impl IntoElement> {
@@ -334,6 +338,8 @@ pub fn file_list<T: 'static>(
         return None;
     }
     let count = files.len();
+    let job = job.filter(|j| j.items.len() == files.len());
+    let locked = job.is_some_and(|j| j.running);
     Some(
         v_flex()
             .w_full()
@@ -349,11 +355,24 @@ pub fn file_list<T: 'static>(
                     .border_color(theme::border())
                     .text_size(px(12.))
                     .text_color(hex(theme::TEXT_SECONDARY))
-                    .child(format!("{count} file{} selected", if count == 1 { "" } else { "s" })),
+                    .child(
+                        h_flex()
+                            .gap(px(6.))
+                            .child(format!("{count} file{} selected", if count == 1 { "" } else { "s" }))
+                            .children(job.and_then(|j| j.summary()).filter(|(text, _)| !text.is_empty()).map(
+                                |(text, failed)| {
+                                    h_flex()
+                                        .gap(px(6.))
+                                        .child("\u{00b7}")
+                                        .child(div().text_color(hex(if failed { theme::DANGER } else { theme::SUCCESS })).child(text))
+                                },
+                            )),
+                    ),
             )
             .children(files.iter().enumerate().map(|(i, file)| {
                 let ext = file_ext(file);
                 let is_folder = ext.is_empty();
+                let item = job.and_then(|j| j.item(i));
                 h_flex()
                     .gap(px(10.))
                     .px(px(14.))
@@ -372,23 +391,30 @@ pub fn file_list<T: 'static>(
                             .flex_1()
                             .min_w_0()
                             .overflow_hidden()
+                            .gap(px(2.))
                             .child(div().text_size(px(13.)).truncate().child(basename(file).to_string()))
-                            .child(
-                                div()
-                                    .text_size(px(11.))
-                                    .text_color(hex(theme::TEXT_MUTED))
-                                    .truncate()
-                                    .child(file_dir(file)),
-                            ),
+                            .map(|this| match item.and_then(|item| item_detail(&format!("{id}-{i}"), item)) {
+                                Some(detail) => this.child(detail),
+                                None => this.child(
+                                    div()
+                                        .text_size(px(11.))
+                                        .text_color(hex(theme::TEXT_MUTED))
+                                        .truncate()
+                                        .child(file_dir(file)),
+                                ),
+                            }),
                     )
-                    .child(
-                        Button::new(SharedString::from(format!("{id}-remove-{i}")))
-                            .ghost()
-                            .xsmall()
-                            .icon(AppIcon::X)
-                            .tooltip("Remove file")
-                            .on_click(cx.listener(move |this, _, window, cx| on_remove(this, i, window, cx))),
-                    )
+                    .children(item.map(item_status_badge))
+                    .when(!locked, |this| {
+                        this.child(
+                            Button::new(SharedString::from(format!("{id}-remove-{i}")))
+                                .ghost()
+                                .xsmall()
+                                .icon(AppIcon::X)
+                                .tooltip("Remove file")
+                                .on_click(cx.listener(move |this, _, window, cx| on_remove(this, i, window, cx))),
+                        )
+                    })
             })),
     )
 }
@@ -491,165 +517,6 @@ pub fn set_select(select: &OptSelect, value: &'static str, window: &mut Window, 
 
 pub fn select(id: &'static str, state: &OptSelect) -> Select<Vec<Opt>> {
     Select::new(state).id(id).w_full()
-}
-
-// ---------------------------------------------------------------------------
-// Progress + console
-// ---------------------------------------------------------------------------
-
-/// Progress bar, status line and output console for a page's runs.
-pub struct RunView {
-    pub running: bool,
-    pub percent: f32,
-    pub message: String,
-    pub lines: Vec<String>,
-    console: ScrollHandle,
-}
-
-impl Default for RunView {
-    fn default() -> Self {
-        Self {
-            running: false,
-            percent: 0.0,
-            message: String::new(),
-            lines: Vec::new(),
-            console: ScrollHandle::new(),
-        }
-    }
-}
-
-const MAX_LINES: usize = 200;
-
-impl RunView {
-    pub fn start(&mut self, message: impl Into<String>) {
-        self.running = true;
-        self.percent = 0.0;
-        self.message = message.into();
-        self.lines.clear();
-    }
-
-    pub fn cancelled(&mut self) {
-        self.running = false;
-        self.percent = 0.0;
-        self.message = "Cancelled".into();
-    }
-
-    pub fn clear(&mut self) {
-        self.lines.clear();
-        self.percent = 0.0;
-        self.message.clear();
-    }
-
-    pub fn set_progress(&mut self, percent: f32, message: impl Into<String>) {
-        self.percent = percent;
-        self.message = message.into();
-    }
-
-    pub fn push_line(&mut self, line: String) {
-        if self.lines.len() > MAX_LINES {
-            let excess = self.lines.len() - MAX_LINES;
-            self.lines.drain(..excess);
-        }
-        self.lines.push(line);
-        self.console.scroll_to_bottom();
-    }
-
-    /// Apply a runner event already known to belong to this page.
-    pub fn apply(&mut self, event: &RunnerEvent) {
-        match event {
-            RunnerEvent::Progress { percent, message, .. } => self.set_progress(*percent, message.clone()),
-            RunnerEvent::Output { line, .. } => self.push_line(line.clone()),
-            RunnerEvent::Done { code, .. } => {
-                self.running = false;
-                self.percent = 100.0;
-                self.message = if *code == 0 {
-                    "Completed successfully!".into()
-                } else {
-                    format!("Completed with exit code: {code}")
-                };
-            }
-            RunnerEvent::Error { message, .. } => {
-                self.lines.push(format!("ERROR: {message}"));
-                self.console.scroll_to_bottom();
-            }
-        }
-    }
-
-    pub fn visible(&self) -> bool {
-        self.running || !self.lines.is_empty()
-    }
-
-    pub fn render(&self, id: &'static str, cx: &App) -> Option<impl IntoElement> {
-        let mono = cx.theme().mono_font_family.clone();
-        if !self.visible() {
-            return None;
-        }
-        let complete = self.percent >= 100.0;
-        let line_color = |line: &str| {
-            if line.to_lowercase().contains("error") {
-                hex(theme::DANGER)
-            } else if line.contains("Done!") {
-                hex(theme::SUCCESS)
-            } else if line.starts_with('[') || line.starts_with('>') {
-                hex(theme::ACCENT)
-            } else {
-                hex(theme::TEXT_SECONDARY)
-            }
-        };
-        Some(
-            v_flex()
-                .w_full()
-                .gap(px(10.))
-                .p(px(16.))
-                .rounded(px(14.))
-                .border_1()
-                .border_color(theme::border())
-                .bg(hexa(theme::BG_SECONDARY, 0.9))
-                .child(
-                    Progress::new(SharedString::from(format!("{id}-bar")))
-                        .value(self.percent)
-                        .color(hex(if complete { theme::SUCCESS } else { theme::ACCENT })),
-                )
-                .child(
-                    h_flex()
-                        .justify_between()
-                        .gap(px(12.))
-                        .text_size(px(13.))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .text_color(hex(theme::TEXT_SECONDARY))
-                                .child(if self.message.is_empty() { "Waiting...".to_string() } else { self.message.clone() }),
-                        )
-                        .child(
-                            div()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(hex(if complete { theme::SUCCESS } else { theme::ACCENT }))
-                                .child(format!("{:.1}%", self.percent)),
-                        ),
-                )
-                .when(!self.lines.is_empty(), |this| {
-                    this.child(
-                        div()
-                            .id(SharedString::from(format!("{id}-console")))
-                            .w_full()
-                            .h(px(220.))
-                            .p(px(10.))
-                            .rounded(px(10.))
-                            .bg(hex(theme::BG_PRIMARY))
-                            .border_1()
-                            .border_color(theme::border())
-                            .overflow_y_scroll()
-                            .track_scroll(&self.console)
-                            .font_family(mono)
-                            .text_size(px(12.))
-                            .children(self.lines.iter().map(|l| div().text_color(line_color(l)).child(l.clone()))),
-                    )
-                }),
-        )
-    }
 }
 
 // ---------------------------------------------------------------------------

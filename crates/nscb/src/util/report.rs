@@ -38,6 +38,8 @@ pub struct ProgressSnapshot {
     pub message: String,
     pub position: u64,
     pub length: Option<u64>,
+    /// Smoothed rate in units per second (bytes/s for byte bars).
+    pub rate: f64,
 }
 
 impl ProgressSnapshot {
@@ -54,12 +56,18 @@ impl ProgressSnapshot {
     /// Human-readable status, e.g. `Compressing NCAs... 1.00 GiB / 4.00 GiB`.
     pub fn describe(&self) -> String {
         match (self.kind, self.length) {
-            (ProgressKind::Bytes, Some(len)) => format!(
-                "{}... {} / {}",
-                self.message,
-                HumanBytes(self.position.min(len)),
-                HumanBytes(len)
-            ),
+            (ProgressKind::Bytes, Some(len)) => {
+                let mut text = format!(
+                    "{}... {} / {}",
+                    self.message,
+                    HumanBytes(self.position.min(len)),
+                    HumanBytes(len)
+                );
+                if self.rate.is_finite() && self.rate >= 1.0 {
+                    text.push_str(&format!(" \u{00b7} {}/s", HumanBytes(self.rate as u64)));
+                }
+                text
+            }
             (ProgressKind::Items, Some(len)) => {
                 format!("{}... {} / {}", self.message, self.position.min(len), len)
             }
@@ -137,6 +145,16 @@ pub(crate) fn register_bar(kind: ProgressKind, bar: &ProgressBar) {
     }
 }
 
+/// Advance the most recently created unfinished progress bar (embedded only).
+pub fn advance(n: u64) {
+    let Ok(active) = ACTIVE.read() else { return };
+    let Some(state) = active.as_ref() else { return };
+    let Ok(state) = state.lock() else { return };
+    if let Some((_, bar)) = state.bars.iter().rev().find(|(_, b)| !b.is_finished()) {
+        bar.inc(n);
+    }
+}
+
 /// The most recently created unfinished progress bar, if any.
 pub fn snapshot() -> Option<ProgressSnapshot> {
     let active = ACTIVE.read().ok()?;
@@ -147,6 +165,7 @@ pub fn snapshot() -> Option<ProgressSnapshot> {
         message: bar.message(),
         position: bar.position(),
         length: bar.length(),
+        rate: bar.per_sec(),
     })
 }
 
@@ -225,7 +244,9 @@ mod tests {
             bar.inc(1024 * 1024 * 1024);
             let snap = snapshot().unwrap();
             assert_eq!(snap.percent(), Some(25.0));
-            assert_eq!(snap.describe(), "Compressing NCAs... 1.00 GiB / 4.00 GiB");
+            assert!(snap.describe().starts_with("Compressing NCAs... 1.00 GiB / 4.00 GiB"));
+            let rated = ProgressSnapshot { rate: 512.0 * 1024.0 * 1024.0, ..snap.clone() };
+            assert_eq!(rated.describe(), "Compressing NCAs... 1.00 GiB / 4.00 GiB \u{00b7} 512.00 MiB/s");
             bar.finish();
             assert!(snapshot().is_none());
 

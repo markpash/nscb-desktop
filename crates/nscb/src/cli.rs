@@ -221,7 +221,14 @@ pub fn dispatch(args: Args) -> Result<()> {
             args.noversion.as_deref(),
             args.dlcrname.as_deref(),
         );
-        let renamed = rename_target(path, ks, &index, rename_options, temp_dir)?;
+        let outcomes = rename_target(Path::new(path), ks, &index, rename_options, temp_dir)?;
+        let mut renamed = 0usize;
+        for outcome in &outcomes {
+            if let RenameOutcome::Renamed { from, to } = outcome {
+                crate::outln!("{} -> {}", from.display(), to.display());
+                renamed += 1;
+            }
+        }
         crate::outln!("Renamed {} item(s)", renamed);
         return Ok(());
     }
@@ -240,14 +247,14 @@ pub fn dispatch(args: Args) -> Result<()> {
             ));
         }
         let file_refs: Vec<&str> = filtered_files.clone();
-        let merge_name =
-            build_merge_filename_metadata(&file_refs, &args.output_type, ks, &nutdb, temp_dir)
-                .unwrap_or_else(|| build_merge_filename(&file_refs, &args.output_type));
         let nsp_direct_multi_python_mode = args.output_type.eq_ignore_ascii_case("nsp");
-        let output = make_output_path(
-            filtered_files.first().copied().unwrap_or("merged"),
+        let output = merge_output_path(
+            &file_refs,
             &args.ofolder,
-            &merge_name,
+            &args.output_type,
+            ks,
+            &nutdb,
+            temp_dir,
         );
         return crate::ops::merge::merge_with_temp_dir(
             &file_refs,
@@ -329,6 +336,21 @@ pub fn dispatch(args: Args) -> Result<()> {
     Ok(())
 }
 
+/// Output path for a merge: a metadata-derived name (falling back to one parsed from the
+/// input file names) inside `ofolder`.
+pub(crate) fn merge_output_path(
+    files: &[&str],
+    ofolder: &Option<String>,
+    output_type: &str,
+    ks: &KeyStore,
+    nutdb: &NutdbStore,
+    temp_dir: Option<&Path>,
+) -> String {
+    let merge_name = build_merge_filename_metadata(files, output_type, ks, nutdb, temp_dir)
+        .unwrap_or_else(|| build_merge_filename(files, output_type));
+    make_output_path(files.first().copied().unwrap_or("merged"), ofolder, &merge_name)
+}
+
 fn get_key_store<'a>(
     cache: &'a mut Option<KeyStore>,
     explicit_path: Option<&str>,
@@ -375,14 +397,13 @@ impl RenameOptions {
     }
 }
 
-fn rename_target(
-    path: &str,
+pub(crate) fn rename_target(
+    path: &Path,
     ks: &KeyStore,
     nutdb: &crate::nutdb::NutdbIndex,
     options: RenameOptions,
     temp_dir: Option<&Path>,
-) -> Result<usize> {
-    let path = Path::new(path);
+) -> Result<Vec<RenameOutcome>> {
     let mut targets = Vec::new();
     collect_rename_targets(path, &mut targets)?;
     if targets.is_empty() {
@@ -392,13 +413,15 @@ fn rename_target(
         )));
     }
 
-    let mut renamed = 0usize;
+    let pb = crate::util::progress::item_progress(targets.len() as u64, "Renaming");
+    let mut outcomes = Vec::with_capacity(targets.len());
     for target in targets {
-        if rename_single_file(&target, ks, nutdb, options, temp_dir)? {
-            renamed += 1;
-        }
+        crate::util::report::check_cancelled()?;
+        outcomes.push(rename_single_file(&target, ks, nutdb, options, temp_dir)?);
+        pb.inc(1);
     }
-    Ok(renamed)
+    pb.finish_and_clear();
+    Ok(outcomes)
 }
 
 fn collect_rename_targets(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
@@ -450,7 +473,7 @@ fn rename_single_file(
     nutdb: &crate::nutdb::NutdbIndex,
     options: RenameOptions,
     temp_dir: Option<&Path>,
-) -> Result<bool> {
+) -> Result<RenameOutcome> {
     let path_str = path.to_string_lossy().to_string();
     let extension = path
         .extension()
@@ -465,8 +488,8 @@ fn rename_single_file(
         .unwrap_or_default()
         .to_string();
 
-    if should_skip_rename(&file_name, plan.as_ref(), options.mode) {
-        return Ok(false);
+    if let Some(reason) = should_skip_rename(&file_name, plan.as_ref(), options.mode) {
+        return Ok(RenameOutcome::Skipped { path: path.to_path_buf(), reason });
     }
 
     let filename = plan
@@ -476,14 +499,13 @@ fn rename_single_file(
     let target_name = sanitize_output_filename(&filename);
 
     if file_name == target_name {
-        return Ok(false);
+        return Ok(RenameOutcome::Skipped { path: path.to_path_buf(), reason: RenameSkip::AlreadyNamed });
     }
 
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let target_path = dedupe_rename_target(parent, &target_name, path);
     fs::rename(path, &target_path)?;
-    crate::outln!("{} -> {}", path.display(), target_path.display());
-    Ok(true)
+    Ok(RenameOutcome::Renamed { from: path.to_path_buf(), to: target_path })
 }
 
 fn dedupe_rename_target(parent: &Path, target_name: &str, original_path: &Path) -> PathBuf {
@@ -518,17 +540,23 @@ fn same_path_case_insensitive(a: &Path, b: &Path) -> bool {
         .eq_ignore_ascii_case(&b.to_string_lossy().replace('\\', "/"))
 }
 
-fn should_skip_rename(file_name: &str, plan: Option<&RenameNamePlan>, mode: RenameMode) -> bool {
+fn should_skip_rename(
+    file_name: &str,
+    plan: Option<&RenameNamePlan>,
+    mode: RenameMode,
+) -> Option<RenameSkip> {
     match mode {
-        RenameMode::Force => false,
-        RenameMode::SkipIfTid => filename_contains_any_title_id(file_name),
+        RenameMode::Force => None,
+        RenameMode::SkipIfTid => {
+            filename_contains_any_title_id(file_name).then_some(RenameSkip::HasTitleId)
+        }
         RenameMode::SkipCorrectTid => plan
-            .map(|plan| {
+            .filter(|plan| {
                 file_name
                     .to_ascii_uppercase()
                     .contains(&format!("[{}]", plan.title_id))
             })
-            .unwrap_or(false),
+            .map(|_| RenameSkip::HasCorrectTitleId),
     }
 }
 
@@ -541,7 +569,7 @@ fn filename_contains_any_title_id(file_name: &str) -> bool {
 }
 
 /// Build output path: if ofolder is set, put the file there; otherwise use the derived name.
-fn make_output_path(_input: &str, ofolder: &Option<String>, default_name: &str) -> String {
+pub(crate) fn make_output_path(_input: &str, ofolder: &Option<String>, default_name: &str) -> String {
     let file_name = Path::new(default_name)
         .file_name()
         .unwrap_or_default()
@@ -571,7 +599,7 @@ fn sanitize_output_filename(name: &str) -> String {
     crate::util::filename::sanitize_output_filename(name)
 }
 
-fn change_ext(path: &str, new_ext: &str) -> String {
+pub(crate) fn change_ext(path: &str, new_ext: &str) -> String {
     let p = Path::new(path);
     let renamed = p.with_extension(new_ext).to_string_lossy().to_string();
     Regex::new(r"\]\s+\[")
@@ -580,7 +608,7 @@ fn change_ext(path: &str, new_ext: &str) -> String {
         .to_string()
 }
 
-fn compress_ext(path: &str) -> String {
+pub(crate) fn compress_ext(path: &str) -> String {
     let p = Path::new(path);
     let ext = p.extension().unwrap_or_default().to_string_lossy();
     match ext.as_ref() {
@@ -591,7 +619,7 @@ fn compress_ext(path: &str) -> String {
     }
 }
 
-fn decompress_ext(path: &str) -> String {
+pub(crate) fn decompress_ext(path: &str) -> String {
     let p = Path::new(path);
     let ext = p.extension().unwrap_or_default().to_string_lossy();
     match ext.as_ref() {
@@ -739,7 +767,7 @@ fn build_merge_filename(input_paths: &[&str], output_type: &str) -> String {
     )
 }
 
-fn is_ignored_merge_input_path(path_str: &str) -> bool {
+pub(crate) fn is_ignored_merge_input_path(path_str: &str) -> bool {
     let name = Path::new(path_str)
         .file_name()
         .and_then(|n| n.to_str())
@@ -775,33 +803,64 @@ struct RenameNamePlan {
     used_fallback_title: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RenameMode {
+/// When `--renamef` leaves a file alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RenameMode {
+    /// Always rename.
     Force,
+    /// Skip files whose name already contains the correct title ID.
+    #[default]
     SkipCorrectTid,
+    /// Skip files whose name contains any title ID.
     SkipIfTid,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NoVersionMode {
+/// How the version tag is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NoVersionMode {
+    #[default]
     Keep,
     Omit,
+    /// Omit `[v0]` for XCI files only.
     XciNoV0,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DlcRenameMode {
+/// How DLC files are named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DlcRenameMode {
+    /// Not renamed with a DLC-specific name.
+    #[default]
     KeepBaseStyle,
+    /// Use the DLC's own name from metadata or NUTDB.
     PreferControlTitle,
+    /// Use the resolved name where available and append `[DLC N]`.
     AppendTag,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RenameOptions {
+    pub mode: RenameMode,
+    pub add_language: bool,
+    pub no_version: NoVersionMode,
+    pub dlc_mode: DlcRenameMode,
+}
+
+/// Why a file was not renamed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RenameOptions {
-    mode: RenameMode,
-    add_language: bool,
-    no_version: NoVersionMode,
-    dlc_mode: DlcRenameMode,
+pub enum RenameSkip {
+    /// The name already contains the correct title ID (`SkipCorrectTid`).
+    HasCorrectTitleId,
+    /// The name already contains a title ID (`SkipIfTid`).
+    HasTitleId,
+    /// The computed name equals the current name.
+    AlreadyNamed,
+}
+
+/// Result of renaming one file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenameOutcome {
+    Renamed { from: PathBuf, to: PathBuf },
+    Skipped { path: PathBuf, reason: RenameSkip },
 }
 
 fn kind_from_title_type(title_type: Option<TitleType>, title_id: u64) -> MergeKind {
@@ -1552,7 +1611,7 @@ mod tests {
         build_name_plan, build_rename_filename_fallback, build_version_tag, change_ext,
         format_language_tag, make_output_path, sanitize_output_filename, should_skip_rename,
         DlcRenameMode, MergeKind, MergeTitleRecord, NoVersionMode, RenameMode, RenameNamePlan,
-        RenameOptions,
+        RenameOptions, RenameSkip,
     };
     use crate::nutdb::{NutdbIndex, NutdbTitle};
     use std::collections::HashMap;
@@ -1738,16 +1797,14 @@ mod tests {
 
     #[test]
     fn renmode_skip_if_tid_detects_existing_title_id() {
-        assert!(should_skip_rename(
-            "Game [0100F8F0000A2000].nsp",
-            None,
-            RenameMode::SkipIfTid
-        ));
-        assert!(!should_skip_rename(
-            "Game Without Tid.nsp",
-            None,
-            RenameMode::SkipIfTid
-        ));
+        assert_eq!(
+            should_skip_rename("Game [0100F8F0000A2000].nsp", None, RenameMode::SkipIfTid),
+            Some(RenameSkip::HasTitleId)
+        );
+        assert_eq!(
+            should_skip_rename("Game Without Tid.nsp", None, RenameMode::SkipIfTid),
+            None
+        );
     }
 
     #[test]
@@ -1764,16 +1821,22 @@ mod tests {
             language_tag: None,
             used_fallback_title: false,
         };
-        assert!(should_skip_rename(
-            "Base Game [0100F8F0000A2000].nsp",
-            Some(&plan),
-            RenameMode::SkipCorrectTid
-        ));
-        assert!(!should_skip_rename(
-            "Base Game [0100F8F0000A2800].nsp",
-            Some(&plan),
-            RenameMode::SkipCorrectTid
-        ));
+        assert_eq!(
+            should_skip_rename(
+                "Base Game [0100F8F0000A2000].nsp",
+                Some(&plan),
+                RenameMode::SkipCorrectTid
+            ),
+            Some(RenameSkip::HasCorrectTitleId)
+        );
+        assert_eq!(
+            should_skip_rename(
+                "Base Game [0100F8F0000A2800].nsp",
+                Some(&plan),
+                RenameMode::SkipCorrectTid
+            ),
+            None
+        );
     }
 
     #[test]

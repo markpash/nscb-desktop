@@ -1228,26 +1228,8 @@ fn build_python_cnmt_xml(
 }
 
 fn aes_ctr_transform_in_place(key: &[u8; 16], nonce8: &[u8; 8], file_offset: u64, data: &mut [u8]) {
-    let Ok(cipher) = Aes128::new_from_slice(key) else {
-        return;
-    };
-    let mut cached_block_index = u64::MAX;
-    let mut cached_keystream = [0u8; 16];
-    for (i, byte) in data.iter_mut().enumerate() {
-        let abs = file_offset + i as u64;
-        let block_index = abs / 16;
-        let byte_in_block = (abs % 16) as usize;
-        if block_index != cached_block_index {
-            let mut ctr = [0u8; 16];
-            ctr[..8].copy_from_slice(nonce8);
-            ctr[8..].copy_from_slice(&block_index.to_be_bytes());
-            let mut block = aes::Block::from(ctr);
-            cipher.encrypt_block(&mut block);
-            cached_keystream.copy_from_slice(&block);
-            cached_block_index = block_index;
-        }
-        *byte ^= cached_keystream[byte_in_block];
-    }
+    let cipher = <Aes128 as aes::cipher::KeyInit>::new(key.into());
+    crate::crypto::aes_ctr::ctr64be_xor(&cipher, nonce8, file_offset, data);
 }
 
 fn parse_cnmt_from_meta_nca_at(

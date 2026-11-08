@@ -1,6 +1,7 @@
 // Library API: many public items are not consumed by the binary yet.
 #![allow(dead_code)]
 
+pub mod api;
 pub mod cli;
 pub mod crypto;
 pub mod error;

@@ -2,13 +2,18 @@
 //! have an up-to-date merged output.
 
 use super::operation::FORMAT_OPTIONS;
-use crate::core::args::{Op, RunOptions};
+use crate::engine::Progress;
+use crate::jobs::{Job, JobKind, Outcome};
+use crate::ui::job_view::file_name;
+use gpui_kit::component::progress::Progress as ProgressBar;
+use nscb::api::{Format, MergeOptions};
+use std::path::PathBuf;
 use crate::core::batch::{self, BatchGame, GameStatus};
-use crate::runner::{RunOutcome, Runner, RunnerEvent, Source};
+use crate::runner::{JobOutcome, Runner, RunnerEvent, Source};
 use crate::ui::icons::AppIcon;
 use crate::ui::theme::{self, hex, hexa, Accent};
 use crate::ui::widgets::*;
-use gpui_kit::component::button::Button;
+use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::select::SelectEvent;
 use gpui_kit::component::switch::Switch;
@@ -28,7 +33,12 @@ pub struct BatchMergePage {
     running: bool,
     cancelled: bool,
     current: Option<usize>,
-    run: RunView,
+    /// Progress of the game being merged.
+    progress: Option<Progress>,
+    /// Games queued when the batch started, and how many have finished.
+    batch_total: usize,
+    batch_finished: usize,
+    summary: Option<String>,
     _task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -45,15 +55,10 @@ impl BatchMergePage {
         };
         let subscriptions = vec![
             cx.subscribe(&runner, |this, _, event: &RunnerEvent, cx| {
-                if event.source() != Source::BatchMerge {
-                    return;
+                if let RunnerEvent::Progress { source: Source::BatchMerge, progress, .. } = event {
+                    this.progress = Some(progress.clone());
+                    cx.notify();
                 }
-                match event {
-                    // Per-game completion is handled by the run task's outcome.
-                    RunnerEvent::Done { .. } => {}
-                    other => this.run.apply(other),
-                }
-                cx.notify();
             }),
             cx.subscribe(&format, |this, _, event: &SelectEvent<Vec<Opt>>, cx| {
                 if let SelectEvent::Confirm(Some(v)) = event {
@@ -76,7 +81,10 @@ impl BatchMergePage {
             running: false,
             cancelled: false,
             current: None,
-            run: RunView::default(),
+            progress: None,
+            batch_total: 0,
+            batch_finished: 0,
+            summary: None,
             _task: None,
             _subscriptions: subscriptions,
         }
@@ -86,8 +94,8 @@ impl BatchMergePage {
         &self.games
     }
 
-    pub fn run_view(&self) -> &RunView {
-        &self.run
+    pub fn summary(&self) -> Option<&str> {
+        self.summary.as_deref()
     }
 
     pub fn is_running(&self) -> bool {
@@ -152,16 +160,18 @@ impl BatchMergePage {
 
     fn start(&mut self, cx: &mut Context<Self>) {
         let output_dir = input_value(&self.output_dir, cx);
-        if output_dir.is_empty() || self.count(GameStatus::Pending) == 0 || self.running {
+        let pending = self.count(GameStatus::Pending);
+        if output_dir.is_empty() || pending == 0 || self.running {
             return;
         }
         self.running = true;
-        self.run.running = true;
         self.cancelled = false;
-        let options = RunOptions {
-            output: Some(output_dir.clone()),
-            format: Some(self.format_value.to_string()),
-            nodelta: self.nodelta,
+        self.batch_total = pending;
+        self.batch_finished = 0;
+        self.summary = None;
+        let options = MergeOptions {
+            format: if self.format_value == "nsp" { Format::Nsp } else { Format::Xci },
+            exclude_deltas: self.nodelta,
             ..Default::default()
         };
 
@@ -178,10 +188,9 @@ impl BatchMergePage {
                     }
                     game.status = GameStatus::Running;
                     game.message = None;
-                    let (files, name) = (game.files.clone(), game.name.clone());
+                    let files = game.files.clone();
                     this.current = Some(index);
-                    this.run.lines.clear();
-                    this.run.set_progress(0.0, format!("Merging: {name}"));
+                    this.progress = None;
                     cx.notify();
                     Some(Some(files))
                 });
@@ -192,47 +201,62 @@ impl BatchMergePage {
                 };
 
                 let before = batch::file_names(&output_dir);
-                let run = this.update(cx, |this, cx| {
-                    let options = options.clone();
-                    this.runner.update(cx, |r, cx| r.run(Source::BatchMerge, Op::Merge, files, options, cx))
-                });
+                let job = Job::new(JobKind::Merge(options.clone()), files.iter().map(PathBuf::from).collect())
+                    .with_out_dir(Some(PathBuf::from(&output_dir)));
+                let run = this.update(cx, |this, cx| this.runner.update(cx, |r, cx| r.run(Source::BatchMerge, job, cx)));
                 let Ok(run) = run else { break };
                 let outcome = run.await;
 
                 let cancelled = this.read_with(cx, |this, _| this.cancelled).unwrap_or(true);
-                if cancelled || outcome == RunOutcome::Cancelled {
-                    let _ = this.update(cx, |this, cx| {
-                        let game = &mut this.games[index];
-                        game.status = GameStatus::Pending;
-                        game.message = Some("Cancelled".into());
-                        cx.notify();
-                    });
-                    break;
-                }
+                let result = match outcome {
+                    JobOutcome::Finished(mut results) if !cancelled && !results.is_empty() => results.remove(0),
+                    JobOutcome::Rejected => Err("Another operation is running".into()),
+                    _ => {
+                        let _ = this.update(cx, |this, cx| {
+                            let game = &mut this.games[index];
+                            game.status = GameStatus::Pending;
+                            game.message = Some("Cancelled".into());
+                            cx.notify();
+                        });
+                        break;
+                    }
+                };
 
-                let mut new_files: Vec<String> =
-                    batch::file_names(&output_dir).difference(&before).cloned().collect();
+                let mut new_files: Vec<String> = batch::file_names(&output_dir).difference(&before).cloned().collect();
                 new_files.sort();
                 let _ = this.update(cx, |this, cx| {
                     let game = &mut this.games[index];
-                    if outcome == RunOutcome::Completed(0) {
-                        game.status = GameStatus::Done;
-                        game.output_file = new_files.first().cloned();
-                    } else {
-                        game.status = GameStatus::Error;
-                        game.output_file = batch::mark_failed_outputs(&output_dir, &new_files);
-                        game.message = Some("Merge failed".into());
+                    match result {
+                        Ok(Outcome::Files(files)) => {
+                            game.status = GameStatus::Done;
+                            game.output_file = files.first().map(|f| file_name(f)).or_else(|| new_files.first().cloned());
+                        }
+                        Ok(_) => game.status = GameStatus::Done,
+                        Err(message) => {
+                            game.status = GameStatus::Error;
+                            // Partial outputs are prefixed so the next scan doesn't treat them as merged.
+                            game.output_file = batch::mark_failed_outputs(&output_dir, &new_files);
+                            game.message = Some(message);
+                        }
                     }
+                    this.batch_finished += 1;
+                    this.progress = None;
                     cx.notify();
                 });
             }
 
             let _ = this.update(cx, |this, cx| {
                 this.running = false;
-                this.run.running = false;
                 this.current = None;
+                this.progress = None;
                 if !this.cancelled {
-                    this.run.set_progress(100.0, "Batch merge complete!");
+                    let done = this.count(GameStatus::Done);
+                    let failed = this.count(GameStatus::Error);
+                    this.summary = Some(if failed == 0 {
+                        format!("Batch merge complete \u{00b7} {done} merged")
+                    } else {
+                        format!("Batch merge finished \u{00b7} {done} merged, {failed} failed")
+                    });
                 }
                 cx.notify();
             });
@@ -244,7 +268,8 @@ impl BatchMergePage {
         self.cancelled = true;
         self.runner.update(cx, |r, _| r.cancel());
         self.running = false;
-        self.run.cancelled();
+        self.progress = None;
+        self.summary = Some("Cancelled".into());
         cx.notify();
     }
 
@@ -253,8 +278,79 @@ impl BatchMergePage {
             return;
         }
         self.games.clear();
-        self.run.clear();
+        self.summary = None;
         cx.notify();
+    }
+
+    fn render_status(&self) -> Option<impl IntoElement> {
+        if !self.running && self.summary.is_none() {
+            return None;
+        }
+        let current = self.current.and_then(|i| self.games.get(i));
+        let fraction = self.progress.as_ref().and_then(|p| p.percent).unwrap_or(0.0) / 100.0;
+        let percent = if self.batch_total == 0 {
+            0.0
+        } else {
+            ((self.batch_finished as f32 + fraction) / self.batch_total as f32 * 100.0).min(100.0)
+        };
+        let failed = self.count(GameStatus::Error) > 0;
+        let headline = if self.running {
+            format!(
+                "Merging {} of {}{}",
+                (self.batch_finished + 1).min(self.batch_total),
+                self.batch_total,
+                current.map(|g| format!(" \u{00b7} {}", g.name)).unwrap_or_default()
+            )
+        } else {
+            self.summary.clone().unwrap_or_default()
+        };
+        let color = if self.running || self.cancelled {
+            theme::ACCENT
+        } else if failed {
+            theme::DANGER
+        } else {
+            theme::SUCCESS
+        };
+        Some(
+            v_flex()
+                .w_full()
+                .gap(px(10.))
+                .p(px(16.))
+                .rounded(px(14.))
+                .border_1()
+                .border_color(theme::border())
+                .bg(hexa(theme::BG_SECONDARY, 0.9))
+                .child(
+                    h_flex()
+                        .gap(px(8.))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(px(14.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(hex(if self.cancelled && !self.running { theme::TEXT_SECONDARY } else { color }))
+                                .child(headline),
+                        )
+                        .when(self.running, |this| {
+                            this.child(
+                                div()
+                                    .text_size(px(13.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(hex(theme::ACCENT))
+                                    .child(format!("{percent:.0}%")),
+                            )
+                        }),
+                )
+                .when(self.running, |this| {
+                    this.child(ProgressBar::new("batch-bar").value(percent).color(hex(theme::ACCENT))).children(
+                        self.progress.as_ref().map(|p| {
+                            div().text_size(px(12.)).text_color(hex(theme::TEXT_SECONDARY)).truncate().child(p.message.clone())
+                        }),
+                    )
+                }),
+        )
     }
 
     fn render_game(&self, index: usize, game: &BatchGame, cx: &mut Context<Self>) -> impl IntoElement {
@@ -304,15 +400,42 @@ impl BatchMergePage {
                     .flex_1()
                     .min_w_0()
                     .child(div().text_size(px(13.)).truncate().child(game.name.clone()))
-                    .when_some(game.output_file.clone(), |this, f| {
-                        this.child(div().text_size(px(11.)).text_color(hex(theme::TEXT_MUTED)).truncate().child(f))
+                    .when(is_current, |this| {
+                        this.children(self.progress.as_ref().map(|p| {
+                            div().text_size(px(11.)).text_color(hex(theme::TEXT_SECONDARY)).truncate().child(p.message.clone())
+                        }))
                     })
-                    .when(game.output_file.is_none(), |this| {
-                        this.when_some(game.message.clone(), |this, m| {
-                            this.child(div().text_size(px(11.)).text_color(hex(theme::TEXT_MUTED)).child(m))
-                        })
+                    .when_some(game.output_file.clone(), |this, f| {
+                        let path = PathBuf::from(input_value(&self.output_dir, cx)).join(&f);
+                        this.child(
+                            h_flex()
+                                .gap(px(4.))
+                                .child(div().text_size(px(11.)).text_color(hex(theme::TEXT_MUTED)).truncate().child(f))
+                                .when(path.exists(), |this| {
+                                    this.child(
+                                        Button::new(SharedString::from(format!("game-reveal-{index}")))
+                                            .ghost()
+                                            .xsmall()
+                                            .icon(AppIcon::Folder)
+                                            .tooltip(crate::ui::job_view::reveal_label())
+                                            .on_click(move |_, _, cx| cx.reveal_path(&path)),
+                                    )
+                                }),
+                        )
+                    })
+                    .when_some(game.message.clone(), |this, m| {
+                        let color = if game.status == GameStatus::Error { theme::DANGER } else { theme::TEXT_MUTED };
+                        this.child(div().text_size(px(11.)).text_color(hex(color)).child(m))
                     }),
             )
+            .when(is_current, |this| {
+                let percent = self.progress.as_ref().and_then(|p| p.percent);
+                this.child(div().w(px(90.)).child(
+                    ProgressBar::new(SharedString::from(format!("game-progress-{index}")))
+                        .value(percent.unwrap_or(0.0))
+                        .loading(percent.is_none()),
+                ))
+            })
             .child(
                 div()
                     .text_size(px(12.))
@@ -439,7 +562,7 @@ impl Render for BatchMergePage {
                     v_flex().children(rows),
                 ))
             })
-            .children(self.run.render("progress", cx))
+            .children(self.render_status())
             .when(total > 0, |this| {
                 this.child(action_bar(
                     running,

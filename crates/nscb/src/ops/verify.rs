@@ -1,7 +1,9 @@
 use rsa::pss::{Signature, VerifyingKey};
 use rsa::signature::Verifier as _;
 use rsa::BigUint;
-use sha2::{Digest, Sha256};
+use sha2::Digest;
+/// SHA-256 for rsa 0.9's PSS verifier (sha2 0.10 digest traits).
+type RsaSha256 = sha2_rsa::Sha256;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
@@ -176,27 +178,13 @@ fn run_verify<R: Read + Seek>(
     let mut feed = String::new();
     if text_file.is_some() {
         // Non-interactive mode: respect vertype
-        let (dec_verdict, dec_output) = run_dec_test(entries, reader, path, ks, token)?;
-        crate::out!("{}", dec_output);
-        feed.push_str(&dec_output);
-        let mut overall_verdict = dec_verdict;
-
-        if vertype == "lv2" || vertype == "lv3" {
-            let (sig_verdict, header_info, sig_output) = run_sig_test(entries, reader, ks, token)?;
-            crate::out!("{}", sig_output);
-            feed.push_str(&sig_output);
+        let stages = run_stages(entries, reader, path, ks, vertype, &mut |_| {})?;
+        let mut overall_verdict = true;
+        for stage in &stages {
+            crate::out!("{}", stage.report);
+            feed.push_str(&stage.report);
             if overall_verdict {
-                overall_verdict = sig_verdict;
-            }
-
-            if vertype == "lv3" {
-                let (hash_verdict, hash_output) =
-                    run_hash_test(entries, reader, ks, token, &header_info, sig_verdict)?;
-                crate::out!("{}", hash_output);
-                feed.push_str(&hash_output);
-                if overall_verdict {
-                    overall_verdict = hash_verdict;
-                }
+                overall_verdict = stage.passed;
             }
         }
 
@@ -206,11 +194,11 @@ fn run_verify<R: Read + Seek>(
     } else {
         // Interactive mode: always run LV1 + LV2 + prompt for LV3 + prompt for text file
         // (matching Python behavior exactly)
-        let (dec_verdict, dec_output) = run_dec_test(entries, reader, path, ks, token)?;
+        let (dec_verdict, dec_output) = run_dec_test(entries, reader, path, ks, token, &mut |_| {})?;
         crate::out!("{}", dec_output);
         feed.push_str(&dec_output);
 
-        let (sig_verdict, header_info, sig_output) = run_sig_test(entries, reader, ks, token)?;
+        let (sig_verdict, header_info, sig_output) = run_sig_test(entries, reader, ks, token, &mut |_| {})?;
         crate::out!("{}", sig_output);
         feed.push_str(&sig_output);
 
@@ -230,7 +218,7 @@ fn run_verify<R: Read + Seek>(
             if input == "1" {
                 crate::outln!();
                 let (_, hash_output) =
-                    run_hash_test(entries, reader, ks, token, &header_info, sig_verdict)?;
+                    run_hash_test(entries, reader, ks, token, &header_info, sig_verdict, &mut |_| {})?;
                 crate::out!("{}", hash_output);
                 feed.push_str(&hash_output);
                 break;
@@ -307,6 +295,521 @@ fn write_massverify_outputs(
 }
 
 // ---------------------------------------------------------------------------
+// Structured API
+// ---------------------------------------------------------------------------
+
+/// How thoroughly to verify.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VerifyLevel {
+    /// lv1: NCAs decrypt with the current keys.
+    #[default]
+    Decryption,
+    /// lv2: lv1 plus NCA header signatures.
+    Signature,
+    /// lv3: lv2 plus content hashes.
+    Full,
+}
+
+impl VerifyLevel {
+    fn vertype(self) -> &'static str {
+        match self {
+            VerifyLevel::Decryption => "lv1",
+            VerifyLevel::Signature => "lv2",
+            VerifyLevel::Full => "lv3",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifyStageKind {
+    Decryption,
+    Signature,
+    Hash,
+}
+
+impl VerifyStageKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            VerifyStageKind::Decryption => "Decryption",
+            VerifyStageKind::Signature => "Signature",
+            VerifyStageKind::Hash => "Hash",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FindingStatus {
+    Ok,
+    /// Needs attention but not a failure (e.g. "needs RSV check", NCZ needs a hash check).
+    Notice,
+    Failed,
+}
+
+/// One checked item (usually an NCA or ticket) within a stage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifyFinding {
+    /// Title and content type the item belongs to, e.g. `0100...000 - Content.PROGRAM`.
+    pub group: Option<String>,
+    pub item: String,
+    pub status: FindingStatus,
+    /// The backend's wording, e.g. `is CORRECT`, plus any notes.
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifyStage {
+    pub kind: VerifyStageKind,
+    pub passed: bool,
+    pub findings: Vec<VerifyFinding>,
+    /// The stage's full text report.
+    pub report: String,
+}
+
+/// Progress of a running verification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerifyEvent {
+    /// The container entries that will be checked, in container order.
+    Plan(Vec<String>),
+    /// A finding was added or updated (`index` within its stage's findings).
+    Finding { stage: VerifyStageKind, index: usize, finding: VerifyFinding },
+    /// A stage completed.
+    StageDone(VerifyStage),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifyReport {
+    pub level: VerifyLevel,
+    pub passed: bool,
+    pub stages: Vec<VerifyStage>,
+}
+
+impl VerifyReport {
+    /// The full text report (all stages).
+    pub fn text(&self) -> String {
+        self.stages.iter().map(|s| s.report.as_str()).collect()
+    }
+}
+
+/// Verify an NSP/NSX/NSZ/XCI/XCZ non-interactively and return structured results.
+pub fn verify_report(path: &str, ks: &KeyStore, level: VerifyLevel) -> Result<VerifyReport> {
+    verify_report_with(path, ks, level, &mut |_| {})
+}
+
+/// Like [`verify_report`], reporting the plan, each finding and each completed stage
+/// to `on_event` as verification proceeds.
+pub fn verify_report_with(
+    path: &str,
+    ks: &KeyStore,
+    level: VerifyLevel,
+    on_event: &mut dyn FnMut(VerifyEvent),
+) -> Result<VerifyReport> {
+    let ext = path.rsplit('.').next().unwrap_or("").to_lowercase();
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let entries: Vec<ContainerEntry> = match ext.as_str() {
+        "nsp" | "nsx" | "nsz" => {
+            let nsp = Nsp::parse(&mut reader)?;
+            nsp.all_entries()
+                .into_iter()
+                .map(|e| ContainerEntry {
+                    name: e.name.clone(),
+                    abs_offset: nsp.pfs0.file_abs_offset(e),
+                    size: e.size,
+                })
+                .collect()
+        }
+        "xci" | "xcz" => {
+            let xci = Xci::parse(&mut reader)?;
+            let secure = xci.secure_partition(&mut reader)?;
+            secure
+                .entries
+                .iter()
+                .map(|e| ContainerEntry {
+                    name: e.name.clone(),
+                    abs_offset: secure.file_abs_offset(e),
+                    size: e.size,
+                })
+                .collect()
+        }
+        _ => {
+            return Err(NscbError::UnsupportedFormat(format!(
+                "Cannot verify .{} file",
+                ext
+            )))
+        }
+    };
+    let stages = run_stages(&entries, &mut reader, path, ks, level.vertype(), on_event)?;
+    let passed = stages.iter().all(|s| s.passed);
+    Ok(VerifyReport { level, passed, stages })
+}
+
+fn run_stages<R: Read + Seek>(
+    entries: &[ContainerEntry],
+    reader: &mut R,
+    path: &str,
+    ks: &KeyStore,
+    vertype: &str,
+    on_event: &mut dyn FnMut(VerifyEvent),
+) -> Result<Vec<VerifyStage>> {
+    use crate::util::progress;
+    use crate::util::report::{check_cancelled, is_embedded};
+
+    let token = container_token(path);
+    let mut stages = Vec::new();
+    // Per-stage progress for embedding hosts; the CLI prints stage reports instead.
+    let embedded = is_embedded();
+
+    on_event(VerifyEvent::Plan(
+        entries
+            .iter()
+            .filter(|e| e.name.ends_with(".nca") || e.name.ends_with(".ncz") || e.name.ends_with(".tik"))
+            .map(|e| e.name.clone())
+            .collect(),
+    ));
+
+    let pb = embedded.then(|| progress::spinner("Checking decryption"));
+    let (dec_verdict, dec_output) = run_dec_test(entries, reader, path, ks, token, on_event)?;
+    if let Some(pb) = pb {
+        pb.finish_and_clear();
+    }
+    let done = stage(VerifyStageKind::Decryption, dec_verdict, dec_output);
+    on_event(VerifyEvent::StageDone(done.clone()));
+    stages.push(done);
+    check_cancelled()?;
+
+    if vertype == "lv2" || vertype == "lv3" {
+        let pb = embedded.then(|| progress::spinner("Checking signatures"));
+        let (sig_verdict, header_info, sig_output) = run_sig_test(entries, reader, ks, token, on_event)?;
+        if let Some(pb) = pb {
+            pb.finish_and_clear();
+        }
+        let done = stage(VerifyStageKind::Signature, sig_verdict, sig_output);
+        on_event(VerifyEvent::StageDone(done.clone()));
+        stages.push(done);
+        check_cancelled()?;
+
+        if vertype == "lv3" {
+            let total: u64 = entries
+                .iter()
+                .filter(|e| e.name.ends_with(".nca") || e.name.ends_with(".ncz"))
+                .map(|e| e.size)
+                .sum();
+            let pb = embedded.then(|| progress::file_progress(total, "Hashing contents"));
+            let (hash_verdict, hash_output) =
+                run_hash_test(entries, reader, ks, token, &header_info, sig_verdict, on_event)?;
+            if let Some(pb) = pb {
+                pb.finish_and_clear();
+            }
+            let done = stage(VerifyStageKind::Hash, hash_verdict, hash_output);
+            on_event(VerifyEvent::StageDone(done.clone()));
+            stages.push(done);
+        }
+    }
+    Ok(stages)
+}
+
+/// Writer that hashes what it is given (after skipping the first `skip` bytes), used to
+/// hash NCZ contents while they are decompressed. With `progress = (compressed,
+/// decompressed)` it advances the active progress bar in compressed-size units.
+struct HashingWriter {
+    hasher: Sha256Hasher,
+    skip: u64,
+    written: u64,
+    progress: Option<(u64, u64)>,
+    advanced: u64,
+}
+
+type Sha256Hasher = sha2::Sha256;
+
+impl HashingWriter {
+    fn new(skip: u64, progress: Option<(u64, u64)>) -> Self {
+        Self::with_hasher(Sha256Hasher::new(), skip, progress)
+    }
+
+    fn with_hasher(hasher: Sha256Hasher, skip: u64, progress: Option<(u64, u64)>) -> Self {
+        Self { hasher, skip, written: 0, progress, advanced: 0 }
+    }
+
+    fn finish(self) -> [u8; 32] {
+        self.hasher.finalize().into()
+    }
+}
+
+impl std::io::Write for HashingWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let start = self.written;
+        self.written += data.len() as u64;
+        if self.written > self.skip {
+            let from = self.skip.saturating_sub(start) as usize;
+            self.hasher.update(&data[from..]);
+        }
+        if let Some((compressed, decompressed)) = self.progress.filter(|(_, d)| *d > 0) {
+            let target = (self.written.min(decompressed) as u128 * compressed as u128 / decompressed as u128) as u64;
+            crate::util::report::advance(target - self.advanced.min(target));
+            self.advanced = self.advanced.max(target);
+        }
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Reader that advances the active progress bar by the bytes it reads.
+struct Advancing<R>(R);
+
+impl<R: Read> Read for Advancing<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.0.read(buf)?;
+        crate::util::report::advance(n as u64);
+        Ok(n)
+    }
+}
+
+fn stage(kind: VerifyStageKind, passed: bool, report: String) -> VerifyStage {
+    VerifyStage { kind, passed, findings: parse_findings(&report), report }
+}
+
+fn classify(detail: &str) -> FindingStatus {
+    let upper = detail.to_ascii_uppercase();
+    if upper.contains("INCORRECT")
+        || upper.contains("CORRUPT")
+        || upper.contains("MODIFIED")
+        || upper.contains("MISSING")
+    {
+        FindingStatus::Failed
+    } else if upper.contains("CORRECT") || upper.contains("PROPER") {
+        FindingStatus::Ok
+    } else {
+        FindingStatus::Notice
+    }
+}
+
+/// Incremental parser turning a stage's report lines into per-item findings.
+#[derive(Default)]
+struct FindingParser {
+    group: Option<String>,
+    findings: Vec<VerifyFinding>,
+}
+
+impl FindingParser {
+    /// Feed one line; returns the index of the finding it added or updated.
+    fn feed(&mut self, raw: &str) -> Option<usize> {
+        let line = raw.trim();
+        let findings = &mut self.findings;
+        let last = findings.len().checked_sub(1);
+        if line.is_empty()
+            || line.starts_with('*') && line.chars().all(|c| c == '*')
+            || line.starts_with("VERDICT:")
+            || matches!(line, "DECRYPTION TEST" | "SIGNATURE 1 TEST" | "HASH TEST")
+        {
+            return None;
+        }
+        // Group headers: "<TITLEID> - Content.X", "UNKNOWN - Content.UNKNOWN", "Content.TICKET".
+        if line.starts_with("Content.") || line.contains(" - Content.") {
+            self.group = Some(line.to_string());
+            return None;
+        }
+        // Missing files / tickets.
+        if let Some(rest) = line.strip_prefix("- Missing file from ") {
+            let (tid, name) = rest.split_once(": ").unwrap_or(("", rest));
+            findings.push(VerifyFinding {
+                group: (!tid.is_empty()).then(|| tid.to_ascii_uppercase()),
+                item: name.to_string(),
+                status: FindingStatus::Failed,
+                detail: "missing from the container".into(),
+            });
+            return Some(findings.len() - 1);
+        }
+        if let Some(rest) = line.strip_prefix("- File has titlerights!!! Missing ticket: ") {
+            findings.push(VerifyFinding {
+                group: None,
+                item: rest.to_string(),
+                status: FindingStatus::Failed,
+                detail: "missing ticket for titlerights content".into(),
+            });
+            return Some(findings.len() - 1);
+        }
+        // Hash stage: "- File name: X", then "> FILE IS ..." status lines.
+        if let Some(name) = line.strip_prefix("- File name: ") {
+            findings.push(VerifyFinding {
+                group: self.group.clone(),
+                item: name.to_string(),
+                status: FindingStatus::Notice,
+                detail: String::new(),
+            });
+            return Some(findings.len() - 1);
+        }
+        if let Some(status) = line.strip_prefix("> ").filter(|s| s.starts_with("FILE IS") || s.starts_with("RSV ")) {
+            let i = last?;
+            findings[i].detail = status.to_string();
+            findings[i].status = classify(status);
+            return Some(i);
+        }
+        if let Some(note) = line.strip_prefix("* ") {
+            let i = last?;
+            let f = &mut findings[i];
+            // "* FILE IS CORRECT" after "RSV WAS CHANGED" settles the verdict.
+            if note.starts_with("FILE IS") {
+                f.status = classify(note);
+            }
+            if !f.detail.is_empty() {
+                f.detail.push_str("; ");
+            }
+            f.detail.push_str(note);
+            return Some(i);
+        }
+        if line.starts_with("- SHA256:") || line.starts_with("- ORIG_SHA256:") {
+            return None;
+        }
+        // Decryption/signature items: "[> ]name -> status".
+        if let Some((name, status)) = line.split_once("->") {
+            let item = name.trim().trim_start_matches("> ").trim().to_string();
+            let detail = status.trim().trim_end_matches("<<<-").trim().to_string();
+            findings.push(VerifyFinding { group: self.group.clone(), item, status: classify(&detail), detail });
+            return Some(findings.len() - 1);
+        }
+        // Indented notes ("- note") attach to the previous item.
+        if let Some(note) = line.strip_prefix("- ") {
+            let i = last?;
+            findings[i].detail.push_str("; ");
+            findings[i].detail.push_str(note);
+            return Some(i);
+        }
+        None
+    }
+}
+
+/// Turn a stage's text report into per-item findings.
+fn parse_findings(report: &str) -> Vec<VerifyFinding> {
+    let mut parser = FindingParser::default();
+    for line in report.lines() {
+        parser.feed(line);
+    }
+    parser.findings
+}
+
+/// A stage's report text, reporting each finding to `sink` as its line is written.
+struct StageOut<'a> {
+    kind: VerifyStageKind,
+    text: String,
+    parsed: usize,
+    parser: FindingParser,
+    sink: &'a mut dyn FnMut(VerifyEvent),
+}
+
+impl<'a> StageOut<'a> {
+    fn new(kind: VerifyStageKind, sink: &'a mut dyn FnMut(VerifyEvent)) -> Self {
+        Self { kind, text: String::new(), parsed: 0, parser: FindingParser::default(), sink }
+    }
+
+    fn push_str(&mut self, s: &str) {
+        self.text.push_str(s);
+        self.flush_lines();
+    }
+
+    fn push(&mut self, c: char) {
+        self.text.push(c);
+        self.flush_lines();
+    }
+
+    fn flush_lines(&mut self) {
+        while let Some(pos) = self.text[self.parsed..].find('\n') {
+            let end = self.parsed + pos;
+            let line = self.text[self.parsed..end].to_string();
+            self.parsed = end + 1;
+            if let Some(index) = self.parser.feed(&line) {
+                (self.sink)(VerifyEvent::Finding {
+                    stage: self.kind,
+                    index,
+                    finding: self.parser.findings[index].clone(),
+                });
+            }
+        }
+    }
+
+    fn finish(self) -> String {
+        self.text
+    }
+}
+
+#[cfg(test)]
+mod finding_tests {
+    use super::*;
+
+    #[test]
+    fn hashing_writer_skips_prefix_across_writes() {
+        use std::io::Write;
+        let data: Vec<u8> = (0..10_000u32).map(|i| i as u8).collect();
+        let mut w = HashingWriter::new(0xC00, None);
+        for chunk in data.chunks(777) {
+            w.write_all(chunk).unwrap();
+        }
+        assert_eq!(w.finish(), crate::crypto::hash::sha256(&data[0xC00..]));
+    }
+
+    #[test]
+    fn stage_out_streams_findings_as_lines_complete() {
+        let mut events = Vec::new();
+        let text = {
+            let mut sink = |e: VerifyEvent| events.push(e);
+            let mut out = StageOut::new(VerifyStageKind::Hash, &mut sink);
+            out.push_str("HASH TEST\n  - File name: a.nca");
+            out.push('\n');
+            out.push_str("   > FILE IS CORRUPT\n");
+            out.finish()
+        };
+        assert_eq!(text, "HASH TEST\n  - File name: a.nca\n   > FILE IS CORRUPT\n");
+        let statuses: Vec<_> = events
+            .iter()
+            .map(|e| match e {
+                VerifyEvent::Finding { index, finding, .. } => (*index, finding.status),
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(statuses, [(0, FindingStatus::Notice), (0, FindingStatus::Failed)]);
+    }
+
+    #[test]
+    fn parses_decryption_report() {
+        let report = "***************\nDECRYPTION TEST\n***************\n\
+0100000000010000 - Content.PROGRAM\n\t\tabc.nca -> is CORRECT\n\
+0100000000010000 - Content.META\n\t\tdef.cnmt.nca\t\t  -> is CORRUPT <<<-\n\
+Content.TICKET\n\t\t0100.tik\t\t  -> titlekey is INCORRECT <<<-\n\
+\n- Missing file from 0100000000010000: ghi.nca\n\
+\nVERDICT: NSP FILE IS CORRUPT OR MISSES FILES\n";
+        let f = parse_findings(report);
+        assert_eq!(f.len(), 4);
+        assert_eq!(f[0].item, "abc.nca");
+        assert_eq!(f[0].status, FindingStatus::Ok);
+        assert_eq!(f[0].group.as_deref(), Some("0100000000010000 - Content.PROGRAM"));
+        assert_eq!(f[1].status, FindingStatus::Failed);
+        assert_eq!(f[1].detail, "is CORRUPT");
+        assert_eq!(f[2].group.as_deref(), Some("Content.TICKET"));
+        assert_eq!(f[2].status, FindingStatus::Failed);
+        assert_eq!(f[3].item, "ghi.nca");
+        assert_eq!(f[3].status, FindingStatus::Failed);
+    }
+
+    #[test]
+    fn parses_signature_and_hash_reports() {
+        let sig = "0100000000010800 - Content.META\n    > a.cnmt.nca -> needs RSV check\n\t    - RSV patched\n    > b.nca -> is PROPER\n";
+        let f = parse_findings(sig);
+        assert_eq!(f[0].status, FindingStatus::Notice);
+        assert_eq!(f[0].detail, "needs RSV check; RSV patched");
+        assert_eq!(f[1].status, FindingStatus::Ok);
+
+        let hash = "0100000000010800 - Content.META\n  - File name: a.cnmt.nca\n  - SHA256: x\n   > RSV WAS CHANGED\n     * FILE IS CORRECT\n  - File name: b.nca\n   > FILE IS CORRUPT\n";
+        let f = parse_findings(hash);
+        assert_eq!(f.len(), 2);
+        assert_eq!(f[0].status, FindingStatus::Ok);
+        assert_eq!(f[0].detail, "RSV WAS CHANGED; FILE IS CORRECT");
+        assert_eq!(f[1].status, FindingStatus::Failed);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // lv1: Decryption test
 // ---------------------------------------------------------------------------
 // lv1: Decryption test
@@ -318,9 +821,10 @@ fn run_dec_test<R: Read + Seek>(
     _container_path: &str,
     ks: &KeyStore,
     token: &str,
+    sink: &mut dyn FnMut(VerifyEvent),
 ) -> Result<(bool, String)> {
     let tabs = "\t";
-    let mut out = String::new();
+    let mut out = StageOut::new(VerifyStageKind::Decryption, sink);
     let mut verdict = true;
 
     out.push_str("***************\n");
@@ -509,7 +1013,7 @@ fn run_dec_test<R: Read + Seek>(
         ));
     }
 
-    Ok((verdict, out))
+    Ok((verdict, out.finish()))
 }
 
 fn check_nca_dec<R: Read + Seek>(
@@ -1146,9 +1650,10 @@ fn run_sig_test<R: Read + Seek>(
     reader: &mut R,
     ks: &KeyStore,
     token: &str,
+    sink: &mut dyn FnMut(VerifyEvent),
 ) -> Result<(bool, Vec<NcaSigInfo>, String)> {
     let tabs = "\t";
-    let mut out = String::new();
+    let mut out = StageOut::new(VerifyStageKind::Signature, sink);
     let mut verdict = true;
     let mut header_info: Vec<NcaSigInfo> = Vec::new();
 
@@ -1266,7 +1771,7 @@ fn run_sig_test<R: Read + Seek>(
         ));
     }
 
-    Ok((verdict, header_info, out))
+    Ok((verdict, header_info, out.finish()))
 }
 
 fn verify_nca_signature_full<R: Read + Seek>(
@@ -1291,7 +1796,7 @@ fn verify_nca_signature_full<R: Read + Seek>(
         return (false, vec![], None, false);
     };
 
-    let vk = VerifyingKey::<Sha256>::new(rsa_key);
+    let vk = VerifyingKey::<RsaSha256>::new(rsa_key);
     let Ok(sig) = Signature::try_from(sign1) else {
         return (false, vec![], None, false);
     };
@@ -1312,7 +1817,7 @@ fn verify_nca_signature_full<R: Read + Seek>(
         let n2 = BigUint::from_bytes_be(modulus);
         let e2 = BigUint::from(65537u32);
         if let Ok(rsa_key2) = rsa::RsaPublicKey::new(n2, e2) {
-            let vk2 = VerifyingKey::<Sha256>::new(rsa_key2);
+            let vk2 = VerifyingKey::<RsaSha256>::new(rsa_key2);
             if let Ok(sig2) = Signature::try_from(sign1) {
                 if vk2.verify(&restored_headdata, &sig2).is_ok() {
                     let mut all_notes = vec!["TITLERIGHTS WERE REMOVED".to_string()];
@@ -1353,7 +1858,7 @@ fn verify_nca_signature_full<R: Read + Seek>(
         let n2 = BigUint::from_bytes_be(modulus);
         let e2 = BigUint::from(65537u32);
         if let Ok(rsa_key2) = rsa::RsaPublicKey::new(n2, e2) {
-            let vk2 = VerifyingKey::<Sha256>::new(rsa_key2);
+            let vk2 = VerifyingKey::<RsaSha256>::new(rsa_key2);
             if let Ok(sig2) = Signature::try_from(sign1) {
                 if vk2.verify(&restored_headdata, &sig2).is_ok() {
                     let mut all_notes = notes;
@@ -1454,7 +1959,7 @@ fn restore_header_tr(
     let n = BigUint::from_bytes_be(modulus);
     let e = BigUint::from(65537u32);
     let rsa_key = rsa::RsaPublicKey::new(n, e).ok()?;
-    let vk = VerifyingKey::<Sha256>::new(rsa_key);
+    let vk = VerifyingKey::<RsaSha256>::new(rsa_key);
     let sig = Signature::try_from(sign1).ok()?;
 
     if vk.verify(&headdata, &sig).is_ok() {
@@ -1628,7 +2133,7 @@ fn restore_header_ntr(
     let n = BigUint::from_bytes_be(modulus);
     let e = BigUint::from(65537u32);
     let rsa_key = rsa::RsaPublicKey::new(n, e).ok()?;
-    let vk = VerifyingKey::<Sha256>::new(rsa_key);
+    let vk = VerifyingKey::<RsaSha256>::new(rsa_key);
     let sig = Signature::try_from(sign1).ok()?;
 
     let current_gamecard = header.raw_bytes().get(0x204).copied().unwrap_or(0);
@@ -1747,7 +2252,7 @@ fn try_rsv_bruteforce<R: Read + Seek>(
     let Ok(rsa_key) = rsa::RsaPublicKey::new(n, e) else {
         return (false, vec![], None, false);
     };
-    let vk = VerifyingKey::<Sha256>::new(rsa_key);
+    let vk = VerifyingKey::<RsaSha256>::new(rsa_key);
     let Ok(sig) = Signature::try_from(sign1) else {
         return (false, vec![], None, false);
     };
@@ -2048,8 +2553,9 @@ fn run_hash_test<R: Read + Seek>(
     token: &str,
     header_info: &[NcaSigInfo],
     did_verify: bool,
+    sink: &mut dyn FnMut(VerifyEvent),
 ) -> Result<(bool, String)> {
-    let mut out = String::new();
+    let mut out = StageOut::new(VerifyStageKind::Hash, sink);
     let mut verdict = true;
 
     out.push_str("***************\n");
@@ -2080,28 +2586,20 @@ fn run_hash_test<R: Read + Seek>(
                 out.push('\n');
                 continue;
             }
-            let mut tmp = tempfile::tempfile()?;
-            if let Err(e) = decompress_ncz(reader, &mut tmp, nca_size, entry.abs_offset, entry.size)
+            // Hash the decompressed NCA as it is produced (no temp file).
+            let mut hashing = HashingWriter::new(0, Some((entry.size, nca_size)));
+            if let Err(e) = decompress_ncz(reader, &mut hashing, nca_size, entry.abs_offset, entry.size)
             {
                 out.push_str(&format!("   > FILE IS CORRUPT (decompress error: {})\n", e));
                 verdict = false;
                 out.push('\n');
                 continue;
             }
-            tmp.seek(SeekFrom::Start(0))?;
-            match hash::sha256_streaming(&mut tmp) {
-                Ok(h) => hex::encode(h),
-                Err(e) => {
-                    out.push_str(&format!("   > FILE IS CORRUPT (read error: {})\n", e));
-                    verdict = false;
-                    out.push('\n');
-                    continue;
-                }
-            }
+            hex::encode(hashing.finish())
         } else {
             reader.seek(SeekFrom::Start(entry.abs_offset))?;
             let mut limited = reader.take(entry.size);
-            match hash::sha256_streaming(&mut limited) {
+            match hash::sha256_streaming(&mut Advancing(&mut limited)) {
                 Ok(h) => hex::encode(h),
                 Err(e) => {
                     out.push_str(&format!("   > FILE IS CORRUPT (read error: {})\n", e));
@@ -2187,7 +2685,7 @@ fn run_hash_test<R: Read + Seek>(
         out.push_str(&format!("VERDICT: {} FILE IS CORRUPT\n", token));
     }
 
-    Ok((verdict, out))
+    Ok((verdict, out.finish()))
 }
 
 fn compute_restored_file_sha<R: Read + Seek>(
@@ -2207,21 +2705,11 @@ fn compute_restored_file_sha<R: Read + Seek>(
     hasher.update(orig_header);
 
     if entry.name.ends_with(".ncz") {
+        // Hash everything after the 0xC00-byte header as it is decompressed.
         let nca_size = nca_size?;
-        let mut tmp = tempfile::tempfile().ok()?;
-        decompress_ncz(reader, &mut tmp, nca_size, entry.abs_offset, entry.size).ok()?;
-        tmp.seek(SeekFrom::Start(0xC00)).ok()?;
-        let mut buf = vec![0u8; 1024 * 1024];
-        loop {
-            if crate::util::report::is_cancelled() {
-                return None;
-            }
-            let n = tmp.read(&mut buf).ok()?;
-            if n == 0 {
-                break;
-            }
-            hasher.update(&buf[..n]);
-        }
+        let mut hashing = HashingWriter::with_hasher(hasher, 0xC00, None);
+        decompress_ncz(reader, &mut hashing, nca_size, entry.abs_offset, entry.size).ok()?;
+        hasher = hashing.hasher;
     } else {
         reader
             .seek(SeekFrom::Start(entry.abs_offset + 0xC00))
