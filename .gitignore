@@ -1,11 +1,7 @@
-node_modules/
-dist/
+# Rust build output (includes cargo-packager bundles in target/packages)
+target/
 release/
 *.log
-
-# Tauri build artifacts
-src-tauri/target/
-src-tauri/gen/
 
 # Tools directory — binaries and keys are imported at runtime, never committed
 tools/
