@@ -1,4 +1,4 @@
-//! The tools directory: backend binary, encryption keys, settings and verify scratch files.
+//! The tools directory: encryption keys, settings and verify scratch files.
 //!
 //! Everything lives in `<os temp dir>/nscb-desktop-tools`, the same location the
 //! previous Tauri build used, so existing installs keep their keys and settings.
@@ -10,33 +10,8 @@ use std::path::{Path, PathBuf};
 pub const SETTING_TEMP_DIR: &str = "tempDir";
 pub const SETTING_PROXY: &str = "proxy";
 pub const SETTING_NUTDB_URL: &str = "nutdbUrl";
-const SETTING_BACKEND_VERSION: &str = "backendVersion";
-
 pub const DEFAULT_NUTDB_URL: &str =
     "https://raw.githubusercontent.com/blawar/titledb/master/US.en.json";
-
-/// File name of the nscb_rust backend for the current platform.
-pub fn nscb_binary_name() -> &'static str {
-    if cfg!(target_os = "windows") {
-        "nscb_rust.exe"
-    } else if cfg!(target_os = "macos") {
-        "nscb_rust-macos-arm64"
-    } else {
-        "nscb_rust-linux-amd64"
-    }
-}
-
-/// Working directory for backend processes: the project root in debug builds,
-/// the executable's directory in release builds.
-pub fn app_root_dir() -> PathBuf {
-    if cfg!(debug_assertions) {
-        return PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    }
-    std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(Path::to_path_buf))
-        .unwrap_or_else(|| PathBuf::from("."))
-}
 
 #[derive(Clone, Debug)]
 pub struct Tools {
@@ -66,47 +41,12 @@ impl Tools {
         self.dir.join("prod.keys")
     }
 
-    pub fn backend_path(&self) -> PathBuf {
-        self.dir.join(nscb_binary_name())
-    }
-
     pub fn has_keys(&self) -> bool {
         self.keys_path().exists() || self.dir.join("keys.txt").exists()
     }
 
-    pub fn has_backend(&self) -> bool {
-        self.backend_path().exists()
-    }
-
     pub fn import_keys(&self, src: &Path) -> Result<(), String> {
         fs::copy(src, self.keys_path()).map_err(|e| format!("Failed to copy prod.keys: {e}"))?;
-        Ok(())
-    }
-
-    /// Copy a user-selected backend binary into the tools dir.
-    pub fn import_backend(&self, src: &Path) -> Result<(), String> {
-        if !src.exists() {
-            return Err("Selected file does not exist".into());
-        }
-        let name = src
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        if !name.starts_with("nscb_rust") {
-            return Err("Please select an nscb_rust backend binary".into());
-        }
-        let dst = self.backend_path();
-        fs::copy(src, &dst).map_err(|e| format!("Failed to copy backend binary: {e}"))?;
-        make_executable(&dst);
-        Ok(())
-    }
-
-    /// Write downloaded backend bytes into the tools dir.
-    pub fn install_backend(&self, bytes: &[u8]) -> Result<(), String> {
-        let dst = self.backend_path();
-        fs::write(&dst, bytes).map_err(|e| format!("Failed to save backend binary: {e}"))?;
-        make_executable(&dst);
         Ok(())
     }
 
@@ -166,36 +106,6 @@ impl Tools {
         }
         self.write_settings(&settings)
     }
-
-    /// Installed backend version, migrating the legacy `version.txt` if present.
-    pub fn backend_version(&self) -> String {
-        let v = self.setting(SETTING_BACKEND_VERSION);
-        if !v.is_empty() {
-            return v;
-        }
-        let legacy = self.dir.join("version.txt");
-        if let Ok(text) = fs::read_to_string(&legacy) {
-            let v = text.trim().to_string();
-            if !v.is_empty() {
-                let _ = self.save_setting(SETTING_BACKEND_VERSION, &v);
-            }
-            let _ = fs::remove_file(&legacy);
-            return v;
-        }
-        String::new()
-    }
-
-    pub fn save_backend_version(&self, version: &str) -> Result<(), String> {
-        self.save_setting(SETTING_BACKEND_VERSION, version)
-    }
-}
-
-fn make_executable(_path: &Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(_path, fs::Permissions::from_mode(0o755));
-    }
 }
 
 #[cfg(test)]
@@ -220,34 +130,11 @@ mod tests {
     }
 
     #[test]
-    fn backend_version_migrates_legacy_file() {
-        let tools = temp_tools("version");
-        fs::write(tools.dir().join("version.txt"), "v1.2.3\n").unwrap();
-        assert_eq!(tools.backend_version(), "v1.2.3");
-        assert!(!tools.dir().join("version.txt").exists());
-        assert_eq!(tools.setting(SETTING_BACKEND_VERSION), "v1.2.3");
-        let _ = fs::remove_dir_all(tools.dir());
-    }
-
-    #[test]
     fn keys_detected_as_prod_keys_or_keys_txt() {
         let tools = temp_tools("keys");
         assert!(!tools.has_keys());
         fs::write(tools.dir().join("keys.txt"), "x").unwrap();
         assert!(tools.has_keys());
-        let _ = fs::remove_dir_all(tools.dir());
-    }
-
-    #[test]
-    fn import_backend_rejects_unrelated_binaries() {
-        let tools = temp_tools("import");
-        let other = tools.dir().join("something.exe");
-        fs::write(&other, "x").unwrap();
-        assert!(tools.import_backend(&other).is_err());
-        let ok = tools.dir().join("nscb_rust-download");
-        fs::write(&ok, "bin").unwrap();
-        tools.import_backend(&ok).unwrap();
-        assert!(tools.has_backend());
         let _ = fs::remove_dir_all(tools.dir());
     }
 

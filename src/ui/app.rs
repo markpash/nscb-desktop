@@ -1,5 +1,4 @@
-//! Application shell: first-run setup, sidebar navigation, page hosting, toasts and the
-//! missing-backend banner.
+//! Application shell: first-run setup, sidebar navigation, page hosting and toasts.
 
 use super::icons::AppIcon;
 use super::pages::batch_merge::BatchMergePage;
@@ -8,12 +7,14 @@ use super::pages::info::{InspectPage, INFO, VERIFY};
 use super::pages::merge::MergePage;
 use super::pages::operation::{OperationPage, COMPRESS, CONVERT, DECOMPRESS, DSPL, SPLIT};
 use super::pages::rename::RenamePage;
-use super::pages::settings::{SettingsEvent, SettingsPage};
+use super::pages::settings::SettingsPage;
 use super::theme::{self, hex, hexa};
 use super::widgets::icon_sized;
 use crate::core::github::{self, Release};
 use crate::core::tools::Tools;
+use crate::engine::{Engine, NscbEngine};
 use crate::runner::{Runner, RunnerEvent};
+use std::sync::Arc;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::scroll::ScrollableElement;
@@ -62,7 +63,6 @@ pub struct NscbApp {
     tools: Tools,
     active: PageId,
     has_keys: bool,
-    has_backend: bool,
     app_update: Option<Release>,
     setup_error: Option<String>,
     importing: bool,
@@ -73,12 +73,19 @@ pub struct NscbApp {
 
 impl NscbApp {
     pub fn new(tools: Tools, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        Self::with_update_check(tools, true, window, cx)
+        Self::with_engine(tools, Arc::new(NscbEngine), true, window, cx)
     }
 
-    /// `check_updates: false` skips the GitHub release lookup (used by tests).
-    pub fn with_update_check(tools: Tools, check_updates: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let runner = cx.new(|_| Runner::new(tools.clone()));
+    /// Build with a specific engine; `check_updates: false` skips the GitHub release
+    /// lookup (both used by tests).
+    pub fn with_engine(
+        tools: Tools,
+        engine: Arc<dyn Engine>,
+        check_updates: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let runner = cx.new(|_| Runner::new(tools.clone(), engine));
 
         let settings = cx.new(|cx| SettingsPage::new(tools.clone(), window, cx));
         let r = || runner.clone();
@@ -104,12 +111,6 @@ impl NscbApp {
                     window.push_notification(Notification::error(message.clone()), cx);
                 }
             }),
-            cx.subscribe(&settings, |this, _, event: &SettingsEvent, cx| match event {
-                SettingsEvent::BackendChanged => {
-                    this.has_backend = this.tools.has_backend();
-                    cx.notify();
-                }
-            }),
         ];
 
         // Check for a newer app release in the background.
@@ -130,7 +131,6 @@ impl NscbApp {
 
         Self {
             has_keys: tools.has_keys(),
-            has_backend: tools.has_backend(),
             tools,
             active: PageId::Compress,
             app_update: None,
@@ -173,7 +173,6 @@ impl NscbApp {
                     match this.tools.import_keys(Path::new(&path)) {
                         Ok(()) if this.tools.has_keys() => {
                             this.has_keys = true;
-                            this.has_backend = this.tools.has_backend();
                             window.push_notification(Notification::success("Ready to go!"), cx);
                         }
                         Ok(()) => {}
@@ -336,40 +335,8 @@ impl NscbApp {
                     .border_color(theme::border())
                     .text_size(px(11.))
                     .text_color(hex(theme::TEXT_MUTED))
-                    .child(div().size(px(6.)).rounded_full().bg(hex(if self.has_backend {
-                        theme::SUCCESS
-                    } else {
-                        theme::DANGER
-                    })))
-                    .child("nscb_rust Backend"),
-            )
-    }
-
-    fn render_missing_backend(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        h_flex()
-            .gap(px(10.))
-            .mx(px(24.))
-            .mt(px(16.))
-            .px(px(14.))
-            .py(px(10.))
-            .rounded(px(10.))
-            .border_1()
-            .border_color(hexa(theme::WARNING, 0.3))
-            .bg(hexa(theme::WARNING, 0.08))
-            .text_size(px(13.))
-            .child(div().text_color(hex(theme::WARNING)).child(icon_sized(AppIcon::AlertCircle, 16.)))
-            .child(
-                h_flex()
-                    .flex_1()
-                    .gap(px(4.))
-                    .child(div().font_weight(FontWeight::BOLD).child("nscb_rust backend"))
-                    .child("is missing. Go to Settings > Tools to download or import it."),
-            )
-            .child(
-                Button::new("open-settings")
-                    .small()
-                    .label("Open Settings")
-                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.navigate(PageId::Settings, cx))),
+                    .child(div().size(px(6.)).rounded_full().bg(hex(theme::SUCCESS)))
+                    .child(format!("nscb_rust v{} (built in)", nscb::VERSION)),
             )
     }
 }
@@ -396,7 +363,6 @@ impl Render for NscbApp {
                     .h_full()
                     .min_w_0()
                     .overflow_y_scrollbar()
-                    .when(!self.has_backend, |this| this.child(self.render_missing_backend(cx)))
                     .children(page),
             )
             .into_any_element()

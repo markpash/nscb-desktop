@@ -1,0 +1,26 @@
+[package]
+name = "nscb"
+version = "0.1.18"
+edition = "2021"
+description = "Vendored copy of nscb_rust (https://github.com/cxfcxf/nscb_rust) used as a library by NSCB Desktop"
+publish = false
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+thiserror = "2"
+byteorder = "1"
+aes = "0.8"
+sha2 = "0.10"
+hex = "0.4"
+zstd = "0.13"
+indicatif = "0.17"
+tempfile = "3"
+log = "0.4"
+env_logger = "0.11"
+regex = "1.12.3"
+console = "0.15"
+getrandom = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rsa = "0.9"

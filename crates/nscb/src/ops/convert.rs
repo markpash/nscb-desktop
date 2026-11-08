@@ -1,0 +1,348 @@
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::path::Path;
+
+use sha2::{Digest, Sha256};
+
+use crate::error::{NscbError, Result};
+use crate::formats::hfs0::Hfs0Builder;
+use crate::formats::nca::NcaHeader;
+use crate::formats::nsp::Nsp;
+use crate::formats::pfs0::Pfs0Builder;
+use crate::formats::ticket::Ticket;
+use crate::formats::types;
+use crate::formats::xci::{Xci, XciBuilder, XCI_PREFIX_SIZE};
+use crate::keys::KeyStore;
+use crate::util::{io as uio, progress};
+
+/// Convert NSP to XCI or XCI to NSP.
+pub fn convert(
+    input_path: &str,
+    output_path: &str,
+    output_type: &str,
+    ks: &KeyStore,
+) -> Result<()> {
+    let input_ext = Path::new(input_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    match (input_ext.as_str(), output_type) {
+        ("nsp" | "nsz", "xci") => nsp_to_xci(input_path, output_path, ks),
+        ("xci" | "xcz", "nsp") => xci_to_nsp(input_path, output_path, ks),
+        ("nsp", "nsp") | ("xci", "xci") => Err(NscbError::InvalidData(
+            "Input and output formats are the same".into(),
+        )),
+        _ => Err(NscbError::UnsupportedFormat(format!(
+            "Cannot convert {} to {}",
+            input_ext, output_type
+        ))),
+    }
+}
+
+fn nsp_to_xci(input_path: &str, output_path: &str, ks: &KeyStore) -> Result<()> {
+    crate::outln!("Converting NSP to XCI...");
+
+    let mut file = BufReader::new(File::open(input_path)?);
+    let nsp = Nsp::parse(&mut file)?;
+
+    // Collect NCA entries only (XCI doesn't include tickets/certs)
+    let nca_entries = nsp.nca_entries();
+    if nca_entries.is_empty() {
+        return Err(NscbError::InvalidData("NSP contains no NCA files".into()));
+    }
+
+    let mut enc_title_keys_by_rights: HashMap<[u8; 16], [u8; 16]> = HashMap::new();
+    for tik in nsp.ticket_entries() {
+        let abs_offset = nsp.file_abs_offset(tik);
+        file.seek(SeekFrom::Start(abs_offset))?;
+        let mut raw = vec![0u8; tik.size as usize];
+        file.read_exact(&mut raw)?;
+        if let Ok(t) = Ticket::from_bytes(&raw) {
+            enc_title_keys_by_rights
+                .entry(t.rights_id)
+                .or_insert(t.title_key_block);
+        }
+    }
+
+    struct PreparedNca {
+        size: u64,
+        abs_offset: u64,
+        patched_header: Vec<u8>,
+    }
+    let mut prepared = Vec::with_capacity(nca_entries.len());
+    let mut source_headers = Vec::with_capacity(nca_entries.len());
+
+    // Build secure HFS0
+    for entry in &nca_entries {
+        let abs_offset = nsp.file_abs_offset(entry);
+        file.seek(SeekFrom::Start(abs_offset))?;
+        let mut enc_header = vec![0u8; 0xC00];
+        file.read_exact(&mut enc_header)?;
+
+        let parsed = NcaHeader::from_encrypted(&enc_header, ks)?;
+        source_headers.push(parsed.clone());
+    }
+    let source_is_cartridge = crate::formats::nca::python_xci_is_cartridge(&source_headers, ks);
+
+    let mut secure_builder = Hfs0Builder::new();
+    for entry in &nca_entries {
+        let abs_offset = nsp.file_abs_offset(entry);
+        file.seek(SeekFrom::Start(abs_offset))?;
+        let mut enc_header = vec![0u8; 0xC00];
+        file.read_exact(&mut enc_header)?;
+
+        let parsed = NcaHeader::from_encrypted(&enc_header, ks)?;
+        let title_key = if parsed.has_rights_id() {
+            if let Some(enc_title_key) = enc_title_keys_by_rights.get(&parsed.rights_id) {
+                let mkrev = parsed.key_generation().saturating_sub(1);
+                Some(ks.decrypt_title_key(enc_title_key, mkrev)?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let gc_flag =
+            crate::formats::nca::python_xci_gamecard_flag(&parsed, ks, source_is_cartridge);
+        let patched_header =
+            crate::formats::nca::rewrite_header_for_xci(&enc_header, ks, title_key, gc_flag)?;
+        let hash = crate::crypto::hash::sha256(&patched_header[..0x200]);
+        secure_builder.add_file(entry.name.clone(), entry.size, hash, 0x200);
+        prepared.push(PreparedNca {
+            size: entry.size,
+            abs_offset,
+            patched_header,
+        });
+    }
+
+    let secure_header = secure_builder.build_header_aligned(0x200);
+    let secure_payload_total = secure_builder.total_size();
+    let secure_total = crate::util::align::align_up(secure_payload_total, types::MEDIA_SIZE);
+
+    // Build root HFS0 with gamecard-like partitions: update, normal, secure.
+    let empty_partition = empty_hfs0_partition_0x200();
+    let empty_hash = crate::crypto::hash::sha256(&empty_partition);
+    let secure_hash = crate::crypto::hash::sha256(&secure_header);
+
+    let mut root_builder = Hfs0Builder::new();
+    root_builder.add_file(
+        "update".to_string(),
+        empty_partition.len() as u64,
+        empty_hash,
+        0x200,
+    );
+    root_builder.add_file(
+        "normal".to_string(),
+        empty_partition.len() as u64,
+        empty_hash,
+        0x200,
+    );
+    root_builder.add_file(
+        "secure".to_string(),
+        secure_total,
+        secure_hash,
+        secure_header.len() as u32,
+    );
+
+    let root_header = root_builder.build_header_aligned(0x200);
+    let root_hash = crate::crypto::hash::sha256(&root_header);
+
+    let hfs0_offset: u64 = 0xF000;
+    let secure_offset = hfs0_offset + root_header.len() as u64 + (empty_partition.len() as u64 * 2);
+    let total_size = secure_offset + secure_total;
+
+    if secure_offset % types::MEDIA_SIZE != 0 {
+        return Err(NscbError::InvalidData(
+            "Secure partition offset is not media-aligned".into(),
+        ));
+    }
+
+    let mut xci_builder = XciBuilder::new();
+    xci_builder.auto_card_size(total_size);
+    let xci_header = xci_builder.build_header(
+        hfs0_offset,
+        secure_offset,
+        root_header.len() as u64,
+        &root_hash,
+        total_size,
+    );
+    let game_info = xci_builder.build_game_info(total_size);
+    let sig_padding = xci_builder.sig_padding();
+    let fake_cert = xci_builder.fake_certificate();
+
+    // Write output
+    let pb = progress::file_progress(total_size, "Converting to XCI");
+    let mut out = BufWriter::new(File::create(output_path)?);
+
+    out.write_all(&xci_header)?;
+    out.write_all(&game_info)?;
+    out.write_all(&sig_padding)?;
+    out.write_all(&fake_cert)?;
+    if (xci_header.len() + game_info.len() + sig_padding.len() + fake_cert.len()) as u64
+        != XCI_PREFIX_SIZE
+    {
+        return Err(NscbError::InvalidData("XCI prefix size mismatch".into()));
+    }
+    out.write_all(&root_header)?;
+    out.write_all(&empty_partition)?;
+    out.write_all(&empty_partition)?;
+    out.write_all(&secure_header)?;
+
+    for nca in &prepared {
+        out.write_all(&nca.patched_header)?;
+        pb.inc(nca.patched_header.len() as u64);
+        if nca.size > nca.patched_header.len() as u64 {
+            uio::copy_section(
+                &mut file,
+                &mut out,
+                nca.abs_offset + nca.patched_header.len() as u64,
+                nca.size - nca.patched_header.len() as u64,
+                Some(&pb),
+            )?;
+        }
+    }
+
+    let written_secure = secure_header.len() as u64 + prepared.iter().map(|n| n.size).sum::<u64>();
+    if secure_total > written_secure {
+        let pad_len = (secure_total - written_secure) as usize;
+        out.write_all(&vec![0u8; pad_len])?;
+        pb.inc(pad_len as u64);
+    }
+
+    out.flush()?;
+    pb.finish_with_message("Done");
+    crate::outln!("Written: {}", output_path);
+    Ok(())
+}
+
+fn empty_hfs0_partition_0x200() -> Vec<u8> {
+    let mut part = Vec::with_capacity(0x200);
+    part.extend_from_slice(b"HFS0");
+    part.extend_from_slice(&0u32.to_le_bytes());
+    part.extend_from_slice(&0x1F0u32.to_le_bytes());
+    part.extend_from_slice(&0u32.to_le_bytes());
+    part.resize(0x200, 0);
+    part
+}
+
+fn xci_to_nsp(input_path: &str, output_path: &str, _ks: &KeyStore) -> Result<()> {
+    crate::outln!("Converting XCI to NSP...");
+
+    let mut file = BufReader::new(File::open(input_path)?);
+    let xci = Xci::parse(&mut file)?;
+
+    let secure_entries = xci.secure_nca_entries(&mut file)?;
+    if secure_entries.is_empty() {
+        return Err(NscbError::InvalidData(
+            "XCI secure partition contains no NCA files".into(),
+        ));
+    }
+
+    struct PreparedEntry {
+        name: String,
+        size: u64,
+        abs_offset: u64,
+        patched_header: Vec<u8>,
+        xml: Option<(String, Vec<u8>)>,
+    }
+    let mut prepared = Vec::with_capacity(secure_entries.len());
+
+    let mut builder = Pfs0Builder::new();
+    for entry in &secure_entries {
+        file.seek(SeekFrom::Start(entry.abs_offset))?;
+        let mut enc_header = vec![0u8; 0xC00];
+        file.read_exact(&mut enc_header)?;
+        let patched_header = crate::formats::nca::rewrite_header_for_nsp(&enc_header, _ks)?;
+        let meta_hash = if entry.name.ends_with(".cnmt.nca") {
+            Some(hash_patched_nca(
+                &mut file,
+                entry.abs_offset,
+                entry.size,
+                &patched_header,
+            )?)
+        } else {
+            None
+        };
+        let xml = crate::ops::merge::generate_meta_xml_bytes(
+            &mut file,
+            &entry.name,
+            entry.abs_offset,
+            entry.size,
+            _ks,
+            None,
+            None,
+            meta_hash.as_deref(),
+        )?;
+        builder.add_file(entry.name.clone(), entry.size);
+        if let Some((ref xml_name, ref xml_bytes)) = xml {
+            builder.add_file(xml_name.clone(), xml_bytes.len() as u64);
+        }
+        prepared.push(PreparedEntry {
+            name: entry.name.clone(),
+            size: entry.size,
+            abs_offset: entry.abs_offset,
+            patched_header,
+            xml,
+        });
+    }
+
+    let header = builder.build_header();
+    let total = builder.total_size();
+    let pb = progress::file_progress(total, "Converting to NSP");
+
+    let mut out = BufWriter::new(File::create(output_path)?);
+
+    out.write_all(&header)?;
+    pb.set_position(header.len() as u64);
+
+    for entry in &prepared {
+        out.write_all(&entry.patched_header)?;
+        pb.inc(entry.patched_header.len() as u64);
+
+        if entry.size > entry.patched_header.len() as u64 {
+            uio::copy_section(
+                &mut file,
+                &mut out,
+                entry.abs_offset + entry.patched_header.len() as u64,
+                entry.size - entry.patched_header.len() as u64,
+                Some(&pb),
+            )?;
+        }
+
+        if let Some((_xml_name, xml_bytes)) = &entry.xml {
+            out.write_all(xml_bytes)?;
+            pb.inc(xml_bytes.len() as u64);
+        }
+    }
+
+    out.flush()?;
+    pb.finish_with_message("Done");
+    crate::outln!("Written: {}", output_path);
+    Ok(())
+}
+
+fn hash_patched_nca(
+    file: &mut BufReader<File>,
+    abs_offset: u64,
+    size: u64,
+    patched_header: &[u8],
+) -> Result<String> {
+    let mut hasher = Sha256::new();
+    hasher.update(patched_header);
+    let mut remaining = size.saturating_sub(patched_header.len() as u64);
+    let mut offset = abs_offset + patched_header.len() as u64;
+    let mut buf = vec![0u8; 1024 * 1024];
+    while remaining > 0 {
+        crate::util::report::check_cancelled()?;
+        let to_read = remaining.min(buf.len() as u64) as usize;
+        file.seek(SeekFrom::Start(offset))?;
+        file.read_exact(&mut buf[..to_read])?;
+        hasher.update(&buf[..to_read]);
+        remaining -= to_read as u64;
+        offset += to_read as u64;
+    }
+    Ok(hex::encode(hasher.finalize()))
+}

@@ -1,15 +1,16 @@
-//! Spawns the nscb_rust backend, streams its output as [`RunnerEvent`]s and batches
-//! single-file operations sequentially.
+//! Runs backend operations on a worker thread through an [`Engine`], streams their
+//! output as [`RunnerEvent`]s and batches single-file operations sequentially.
 
 use crate::core::args::{basename, build_args, dirname, Op, RunOptions};
-use crate::core::progress::{normalize, parse_stderr_chunk, parse_stdout_line, Parsed};
-use crate::core::tools::{app_root_dir, nscb_binary_name, Tools, SETTING_TEMP_DIR};
+use crate::core::progress::{parse_stdout_line, Parsed};
+use crate::core::tools::{Tools, SETTING_TEMP_DIR};
+use crate::engine::{Engine, EngineMsg, RunContext};
 use futures::channel::mpsc;
 use futures::StreamExt;
-use gpui_kit::{Context, EventEmitter, Task};
-use std::io::{BufRead, BufReader, Read};
-use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use gpui_kit::{AsyncApp, Context, EventEmitter, Task, WeakEntity};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 /// Which page started a run; events are routed back to it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -55,37 +56,35 @@ pub enum RunOutcome {
     Rejected,
 }
 
-enum ProcessMsg {
-    Stdout(String),
-    Stderr(String),
+enum WorkerMsg {
+    Engine(EngineMsg),
     Exited(i32),
-}
-
-struct ActiveRun {
-    op: Op,
 }
 
 pub struct Runner {
     tools: Tools,
-    active: Option<ActiveRun>,
+    engine: Arc<dyn Engine>,
+    active: Option<Op>,
     /// Incremented by every run and cancel; a run whose generation is stale stops.
     generation: u64,
-    pid: Arc<Mutex<Option<u32>>>,
+    /// Cancel flag of the invocation currently on the worker thread.
+    cancel_flag: Option<Arc<AtomicBool>>,
+    /// Set while an engine invocation is executing (including a cancelled one winding down).
+    worker_busy: Arc<AtomicBool>,
     last_output_line: String,
 }
 
 impl EventEmitter<RunnerEvent> for Runner {}
 
-#[cfg(target_os = "windows")]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
 impl Runner {
-    pub fn new(tools: Tools) -> Self {
+    pub fn new(tools: Tools, engine: Arc<dyn Engine>) -> Self {
         Self {
             tools,
+            engine,
             active: None,
             generation: 0,
-            pid: Arc::new(Mutex::new(None)),
+            cancel_flag: None,
+            worker_busy: Arc::new(AtomicBool::new(false)),
             last_output_line: String::new(),
         }
     }
@@ -108,8 +107,8 @@ impl Runner {
         options: RunOptions,
         cx: &mut Context<Self>,
     ) -> Task<RunOutcome> {
-        if let Some(active) = &self.active {
-            let message = format!("A process is already running ({})", active.op.name());
+        if let Some(active) = self.active {
+            let message = format!("A process is already running ({})", active.name());
             cx.emit(RunnerEvent::Error { source, message });
             cx.emit(RunnerEvent::Done { source, code: -1 });
             return Task::ready(RunOutcome::Rejected);
@@ -117,7 +116,7 @@ impl Runner {
 
         self.generation += 1;
         let generation = self.generation;
-        self.active = Some(ActiveRun { op });
+        self.active = Some(op);
 
         let batches: Vec<Vec<String>> = if op.is_single_file() && files.len() > 1 {
             files.into_iter().map(|f| vec![f]).collect()
@@ -128,6 +127,13 @@ impl Runner {
         cx.spawn(async move |this, cx| {
             let total = batches.len();
             for (index, batch) in batches.into_iter().enumerate() {
+                // A cancelled invocation may still be winding down on the worker.
+                let busy = this.read_with(cx, |r, _| r.worker_busy.clone());
+                let Ok(busy) = busy else { return RunOutcome::Cancelled };
+                while busy.load(Ordering::SeqCst) {
+                    cx.background_executor().timer(Duration::from_millis(20)).await;
+                }
+
                 let prepared = this.update(cx, |runner, cx| {
                     if runner.generation != generation {
                         return None;
@@ -139,49 +145,20 @@ impl Runner {
                             line: format!("[File {}/{}] {}", index + 1, total, name),
                         });
                     }
-                    Some(runner.prepare(source, op, &batch, &options, cx))
+                    let (args, verify_output) = runner.prepare(source, op, &batch, &options, cx);
+                    Some((runner.start_worker(args), verify_output))
                 });
-                let Ok(Some((args, verify_output))) = prepared else {
+                let Ok(Some((rx, verify_output))) = prepared else {
                     return RunOutcome::Cancelled;
                 };
 
-                let spawned = this.update(cx, |runner, _| runner.spawn_process(args));
-                let code = match spawned {
-                    Ok(Ok(mut rx)) => {
-                        let mut code = -1;
-                        while let Some(msg) = rx.next().await {
-                            if let ProcessMsg::Exited(c) = msg {
-                                code = c;
-                                break;
-                            }
-                            let live = this.update(cx, |runner, cx| {
-                                if runner.generation != generation {
-                                    return false;
-                                }
-                                runner.handle_process_output(source, msg, cx);
-                                true
-                            });
-                            if !matches!(live, Ok(true)) {
-                                break;
-                            }
-                        }
-                        code
-                    }
-                    Ok(Err(err)) => {
-                        let _ = this.update(cx, |_, cx| {
-                            cx.emit(RunnerEvent::Error {
-                                source,
-                                message: format!("Failed to start nscb_rust: {err}"),
-                            })
-                        });
-                        -1
-                    }
-                    Err(_) => return RunOutcome::Cancelled,
+                let Some(code) = Self::pump(&this, cx, rx, source, generation).await else {
+                    return RunOutcome::Cancelled;
                 };
 
                 let finished = this.update(cx, |runner, cx| {
                     if runner.generation != generation {
-                        return None;
+                        return RunOutcome::Cancelled;
                     }
                     if let Some(path) = &verify_output {
                         if let Ok(content) = std::fs::read_to_string(path) {
@@ -193,20 +170,19 @@ impl Runner {
                     if code != 0 {
                         runner.active = None;
                         let message = if runner.last_output_line.is_empty() {
-                            format!("nscb_rust exited with code {code}")
+                            format!("nscb_rust failed with code {code}")
                         } else {
-                            format!("nscb_rust exited with code {code}: {}", runner.last_output_line)
+                            format!("nscb_rust failed with code {code}: {}", runner.last_output_line)
                         };
                         cx.emit(RunnerEvent::Error { source, message });
                         cx.emit(RunnerEvent::Done { source, code });
-                        return Some(RunOutcome::Completed(code));
                     }
-                    Some(RunOutcome::Completed(0))
+                    RunOutcome::Completed(code)
                 });
                 match finished {
-                    Ok(Some(RunOutcome::Completed(0))) => continue,
-                    Ok(Some(outcome)) => return outcome,
-                    _ => return RunOutcome::Cancelled,
+                    Ok(RunOutcome::Completed(0)) => continue,
+                    Ok(outcome) => return outcome,
+                    Err(_) => return RunOutcome::Cancelled,
                 }
             }
 
@@ -223,13 +199,39 @@ impl Runner {
         })
     }
 
-    /// Stop the running process. No further events are emitted for the cancelled run.
+    /// Forward worker messages until the invocation exits; `None` if the run was cancelled.
+    async fn pump(
+        this: &WeakEntity<Self>,
+        cx: &mut AsyncApp,
+        mut rx: mpsc::UnboundedReceiver<WorkerMsg>,
+        source: Source,
+        generation: u64,
+    ) -> Option<i32> {
+        while let Some(msg) = rx.next().await {
+            let msg = match msg {
+                WorkerMsg::Exited(code) => return Some(code),
+                WorkerMsg::Engine(msg) => msg,
+            };
+            let live = this.update(cx, |runner, cx| {
+                if runner.generation != generation {
+                    return false;
+                }
+                runner.handle_engine_msg(source, msg, cx);
+                true
+            });
+            if !matches!(live, Ok(true)) {
+                return None;
+            }
+        }
+        Some(-1)
+    }
+
+    /// Stop the running operation. No further events are emitted for the cancelled run.
     pub fn cancel(&mut self) {
         self.generation += 1;
         self.active = None;
-        let pid = self.pid.lock().ok().and_then(|mut p| p.take());
-        if let Some(pid) = pid {
-            kill_process_tree(pid);
+        if let Some(flag) = self.cancel_flag.take() {
+            flag.store(true, Ordering::SeqCst);
         }
     }
 
@@ -268,135 +270,53 @@ impl Runner {
         (args, verify_output)
     }
 
-    fn spawn_process(&mut self, args: Vec<String>) -> Result<mpsc::UnboundedReceiver<ProcessMsg>, String> {
-        let mut pid_slot = self.pid.lock().map_err(|_| "Failed to lock runner state".to_string())?;
-        if pid_slot.is_some() {
-            return Err("A process is already running".into());
-        }
-        let exe = self.tools.backend_path();
-        if !exe.exists() {
-            return Err(format!("{} not found at {}", nscb_binary_name(), exe.display()));
-        }
-
-        let mut cmd = Command::new(exe);
-        cmd.args(args)
-            .current_dir(app_root_dir())
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(CREATE_NO_WINDOW);
-        }
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| format!("Failed to start {}: {e}", nscb_binary_name()))?;
-        let child_pid = child.id();
-        *pid_slot = Some(child_pid);
-
+    fn start_worker(&mut self, args: Vec<String>) -> mpsc::UnboundedReceiver<WorkerMsg> {
         let (tx, rx) = mpsc::unbounded();
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.cancel_flag = Some(cancel.clone());
+        let busy = self.worker_busy.clone();
+        busy.store(true, Ordering::SeqCst);
+        let engine = self.engine.clone();
 
-        let out_tx = tx.clone();
-        let stdout_thread = std::thread::spawn(move || {
-            let Some(stdout) = stdout else { return };
-            let mut reader = BufReader::new(stdout);
-            let mut buf = Vec::new();
-            loop {
-                buf.clear();
-                match reader.read_until(b'\n', &mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {
-                        let line = String::from_utf8_lossy(&buf).trim().to_string();
-                        if !line.is_empty() {
-                            let _ = out_tx.unbounded_send(ProcessMsg::Stdout(line));
-                        }
-                    }
-                }
-            }
-        });
-
-        let err_tx = tx.clone();
-        let stderr_thread = std::thread::spawn(move || {
-            let Some(mut stderr) = stderr else { return };
-            let mut buf = [0u8; 4096];
-            loop {
-                match stderr.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        let chunk = String::from_utf8_lossy(&buf[..n]).into_owned();
-                        if !chunk.trim().is_empty() {
-                            let _ = err_tx.unbounded_send(ProcessMsg::Stderr(chunk));
-                        }
-                    }
-                }
-            }
-        });
-
-        let pid = self.pid.clone();
-        std::thread::spawn(move || {
-            let code = child.wait().ok().and_then(|s| s.code()).unwrap_or(-1);
-            // Deliver remaining output before the exit notification.
-            let _ = stdout_thread.join();
-            let _ = stderr_thread.join();
-            if let Ok(mut slot) = pid.lock() {
-                if *slot == Some(child_pid) {
-                    *slot = None;
-                }
-            }
-            let _ = tx.unbounded_send(ProcessMsg::Exited(code));
-        });
-
-        Ok(rx)
+        std::thread::Builder::new()
+            .name("nscb-worker".into())
+            .spawn(move || {
+                let emit_tx = tx.clone();
+                let ctx = RunContext::new(
+                    move |msg| {
+                        let _ = emit_tx.unbounded_send(WorkerMsg::Engine(msg));
+                    },
+                    cancel,
+                );
+                let code = engine.run(args, ctx);
+                busy.store(false, Ordering::SeqCst);
+                let _ = tx.unbounded_send(WorkerMsg::Exited(code));
+            })
+            .expect("failed to spawn nscb worker thread");
+        rx
     }
 
-    fn handle_process_output(&mut self, source: Source, msg: ProcessMsg, cx: &mut Context<Self>) {
-        let parsed = match msg {
-            ProcessMsg::Stdout(line) => {
+    fn handle_engine_msg(&mut self, source: Source, msg: EngineMsg, cx: &mut Context<Self>) {
+        match msg {
+            EngineMsg::Line(line) => {
                 self.last_output_line = line.clone();
                 let parsed = parse_stdout_line(&line);
                 cx.emit(RunnerEvent::Output { source, line });
-                parsed
-            }
-            ProcessMsg::Stderr(chunk) => {
-                let clean = normalize(&chunk);
-                let trimmed = clean.trim();
-                if !trimmed.is_empty() {
-                    self.last_output_line = trimmed.to_string();
+                match parsed {
+                    Some(Parsed::Progress { percent, message }) => {
+                        cx.emit(RunnerEvent::Progress { source, percent, message })
+                    }
+                    Some(Parsed::Error(message)) => cx.emit(RunnerEvent::Error { source, message }),
+                    Some(Parsed::Status { .. }) | None => {}
                 }
-                parse_stderr_chunk(&clean)
             }
-            ProcessMsg::Exited(_) => None,
-        };
-        match parsed {
-            Some(Parsed::Progress { percent, message }) => {
-                cx.emit(RunnerEvent::Progress { source, percent, message })
+            EngineMsg::Error(message) => {
+                self.last_output_line = message.clone();
+                cx.emit(RunnerEvent::Error { source, message });
             }
-            Some(Parsed::Error(message)) => cx.emit(RunnerEvent::Error { source, message }),
-            Some(Parsed::Status { .. }) | None => {}
+            EngineMsg::Progress { percent, message } => {
+                cx.emit(RunnerEvent::Progress { source, percent, message });
+            }
         }
-    }
-}
-
-fn kill_process_tree(pid: u32) {
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        let _ = Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .creation_flags(CREATE_NO_WINDOW)
-            .status();
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = Command::new("kill")
-            .args(["-9", &pid.to_string()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
     }
 }

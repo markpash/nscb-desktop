@@ -2,7 +2,7 @@
 
 Modern desktop GUI for Nintendo Switch game file operations: compress, decompress, merge, convert, split, repack, rename, and verify (NSP, XCI, NSZ, XCZ, NCZ).
 
-Built in Rust with [GPUI Kit](https://gpui-kit.com) (GPUI + gpui-component). Powered by [nscb_rust](https://github.com/cxfcxf/nscb_rust).
+Built in Rust with [GPUI Kit](https://gpui-kit.com) (GPUI + gpui-component). Powered by [nscb_rust](https://github.com/cxfcxf/nscb_rust), which is built into the app as a library (vendored in `crates/nscb`).
 
 ## Features
 
@@ -21,7 +21,7 @@ Built in Rust with [GPUI Kit](https://gpui-kit.com) (GPUI + gpui-component). Pow
 - Live output console + progress tracking
 - Batch support for compress/decompress/convert/split/rename/verify
 - Dark theme UI with SVG iconography and file type badges
-- Auto-download nscb_rust backend from GitHub releases, or import manually
+- nscb_rust engine built in: a single executable, no separate backend download
 - Proxy support for NUTDB downloads (URL prefix proxy for users behind firewalls)
 - Configurable NUTDB source URL override
 - Configurable temporary directory for large backend working files
@@ -31,16 +31,11 @@ Built in Rust with [GPUI Kit](https://gpui-kit.com) (GPUI + gpui-component). Pow
 
 ## Supported Platforms
 
-| Platform | Architecture | Backend Binary |
-|---|---|---|
-| Windows | x86_64 | `nscb_rust.exe` |
-| Linux | x86_64 | `nscb_rust-linux-amd64` |
-| macOS | ARM64 | `nscb_rust-macos-arm64` |
+Windows x86_64, Linux x86_64, macOS ARM64.
 
 ## Prerequisites
 
 - Switch keys file (`prod.keys` or `keys.txt`)
-- nscb_rust backend binary (auto-downloaded or imported via Settings)
 - **Windows**: Windows 10/11
 - **Linux**: a Vulkan-capable GPU driver, Wayland or X11 (libxkbcommon)
 - **macOS**: macOS 11.0+
@@ -49,10 +44,9 @@ Built in Rust with [GPUI Kit](https://gpui-kit.com) (GPUI + gpui-component). Pow
 
 1. Run the app directly (standalone portable exe), or use the platform package.
 2. On first launch, the setup wizard prompts you to import **encryption keys** (`prod.keys` or `keys.txt`).
-3. If the nscb_rust backend is missing, a banner directs you to **Settings > Tools** where you can download it from GitHub or import manually.
-4. Pick an operation from the sidebar and drop your files.
+3. Pick an operation from the sidebar and drop your files.
 
-Keys, the backend binary, and settings live in `<OS temp dir>/nscb-desktop-tools` (the same location earlier releases used, so existing setups carry over). Set `NSCB_DESKTOP_TOOLS_DIR` to use a different folder.
+Keys and settings live in `<OS temp dir>/nscb-desktop-tools` (the same location earlier releases used, so existing setups carry over). Set `NSCB_DESKTOP_TOOLS_DIR` to use a different folder.
 
 If the system temporary drive is short on space, open **Settings > Tools > Temporary Directory** and select a directory on a larger drive. Leave it blank to keep using the operating system default.
 
@@ -68,8 +62,8 @@ If the system temporary drive is short on space, open **Settings > Tools > Tempo
 Requires [Rust](https://rustup.rs) (stable). On Linux, install the GPUI build dependencies (see `.github/workflows/release.yml`).
 
 ```bash
-cargo run          # Run the app (debug)
-cargo test         # Unit tests + headless UI integration tests
+cargo run                # Run the app (debug)
+cargo test --workspace   # Unit tests (app + nscb) + headless UI integration tests
 ```
 
 ## Build
@@ -93,20 +87,22 @@ nscb-desktop/
 |- src/
 |  |- main.rs              # Entry point
 |  |- lib.rs               # App bootstrap: window, menus, theme, assets
-|  |- runner.rs            # Spawns nscb_rust, streams output, batches single-file ops
+|  |- engine.rs            # Runs the vendored nscb library in-process
+|  |- runner.rs            # Worker-thread runs, event streaming, batching
 |  |- core/                # UI-independent logic (unit tested)
 |  |  |- args.rs           # CLI argument building
 |  |  |- progress.rs       # stdout/stderr progress parsing
 |  |  |- batch.rs          # Batch merge discovery and matching
-|  |  |- tools.rs          # Tools dir, keys/backend import, settings
-|  |  `- github.rs         # Release lookups and backend download
+|  |  |- tools.rs          # Tools dir, keys import, settings
+|  |  `- github.rs         # App update check
 |  `- ui/
 |     |- app.rs            # Shell: setup screen, sidebar, toasts, banner
 |     |- theme.rs          # Dark palette on top of the gpui-kit theme
 |     |- icons.rs          # App SVG icons + asset source
 |     |- widgets.rs        # Drop zone, file list, progress console, etc.
 |     `- pages/            # One module per page
-|- tests/ui.rs             # Headless UI tests against a fake backend
+|- crates/nscb/           # Vendored nscb_rust (see crates/nscb/VENDORED.md)
+|- tests/ui.rs             # Headless UI tests against a fake engine
 |- assets/                 # SVG icons and app icons
 |- build.rs                # Embeds the Windows exe icon
 `- scripts/portable.sh     # Portable folder assembly
@@ -114,4 +110,4 @@ nscb-desktop/
 
 ## License
 
-ISC
+ISC for the NSCB Desktop code. `crates/nscb` is a copy of nscb_rust, whose upstream repository does not include a license; see `crates/nscb/VENDORED.md`.

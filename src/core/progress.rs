@@ -1,9 +1,8 @@
 //! Parsing of nscb_rust output into progress updates.
 //!
-//! - stdout: percentages (`XX%`), byte/item counters, `[ACTION] detail` status lines,
-//!   `Done!` markers and lines containing "error".
-//! - stderr: indicatif progress bars (`X.XX MiB/Y.YY GiB`, `5/12`) and `error:` messages,
-//!   with ANSI escapes stripped.
+//! Output lines may carry percentages (`XX%`), byte/item counters, `[ACTION] detail`
+//! status lines, `Done!` markers and lines containing "error". Progress bars are read
+//! directly from the engine (see `engine.rs`), not parsed.
 
 use regex::Regex;
 use std::sync::LazyLock;
@@ -23,8 +22,6 @@ static WHITESPACE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").unwrap(
 static PERCENT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"([0-9]+(?:\.[0-9]+)?)\s*%").unwrap());
 static ACTION: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\[([A-Za-z0-9_]+)\s*(?:[A-Za-z0-9_]*)\]\s*(.*)").unwrap());
-static STDERR_ERROR: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)error:\s*(.+?)(?:\s{2,}|$)").unwrap());
 static BYTES: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"(?i)([0-9]+(?:\.[0-9]+)?)\s*(B|KiB|MiB|GiB|KB|MB|GB|TB|TiB)\s*/\s*([0-9]+(?:\.[0-9]+)?)\s*(B|KiB|MiB|GiB|KB|MB|GB|TB|TiB)",
@@ -139,16 +136,6 @@ pub fn parse_stdout_line(line: &str) -> Option<Parsed> {
     None
 }
 
-/// Interpret an already-normalized stderr chunk.
-pub fn parse_stderr_chunk(text: &str) -> Option<Parsed> {
-    if text.to_lowercase().contains("error:") {
-        return STDERR_ERROR
-            .captures(text)
-            .map(|c| Parsed::Error(c[1].trim().to_string()));
-    }
-    parse_byte_or_item_progress(text)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,36 +180,28 @@ mod tests {
     }
 
     #[test]
-    fn stderr_byte_progress_uses_label_and_caps_at_99() {
+    fn byte_progress_uses_label_and_caps_at_99() {
         assert_eq!(
-            parse_stderr_chunk("Compressing [=====>   ] 1.00 GiB/4.00 GiB"),
+            parse_byte_or_item_progress("Compressing [=====>   ] 1.00 GiB/4.00 GiB"),
             progress(25.0, "Compressing... 1.00 GiB / 4.00 GiB")
         );
         assert_eq!(
-            parse_stderr_chunk("Writing [====] 4.00 GiB/4.00 GiB"),
+            parse_byte_or_item_progress("Writing [====] 4.00 GiB/4.00 GiB"),
             progress(99.0, "Writing... 4.00 GiB / 4.00 GiB")
         );
     }
 
     #[test]
-    fn stderr_last_counter_wins() {
+    fn last_counter_wins() {
         assert_eq!(
-            parse_stderr_chunk("Hashing [#] 1/4 Hashing [##] 3/4"),
+            parse_byte_or_item_progress("Hashing [#] 1/4 Hashing [##] 3/4"),
             progress(75.0, "Hashing... 3 / 4")
         );
     }
 
     #[test]
-    fn stderr_item_progress_without_label() {
-        assert_eq!(parse_stderr_chunk("5/12"), progress(41.7, "Processing... 5 / 12"));
-        assert_eq!(parse_stderr_chunk("13/12"), None);
-    }
-
-    #[test]
-    fn stderr_error_message() {
-        assert_eq!(
-            parse_stderr_chunk("Error: missing title key"),
-            Some(Parsed::Error("missing title key".into()))
-        );
+    fn item_progress_without_label() {
+        assert_eq!(parse_byte_or_item_progress("5/12"), progress(41.7, "Processing... 5 / 12"));
+        assert_eq!(parse_byte_or_item_progress("13/12"), None);
     }
 }

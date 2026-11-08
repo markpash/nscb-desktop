@@ -1,33 +1,23 @@
-//! Settings: backend binary (download/import), encryption keys, temp dir and network options.
+//! Settings: encryption keys, temp dir and network options; shows the built-in engine version.
 
-use crate::core::github;
 use crate::core::tools::{Tools, DEFAULT_NUTDB_URL, SETTING_NUTDB_URL, SETTING_PROXY, SETTING_TEMP_DIR};
 use crate::ui::icons::AppIcon;
 use crate::ui::theme::{self, hex, hexa, Accent};
 use crate::ui::widgets::*;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::{h_flex, v_flex, Disableable, Sizable};
+use gpui_kit::component::{h_flex, v_flex, Sizable};
 use gpui_kit::prelude::*;
-use gpui_kit::{div, px, AnyElement, ClickEvent, Context, Entity, EventEmitter, FontWeight, IntoElement, Subscription, Window};
-
-pub enum SettingsEvent {
-    BackendChanged,
-}
+use gpui_kit::{div, px, AnyElement, ClickEvent, Context, Entity, FontWeight, IntoElement, Subscription, Window};
 
 pub struct SettingsPage {
     tools: Tools,
-    backend_version: String,
     keys_installed: bool,
-    update_status: Option<String>,
-    checking: bool,
     temp_dir: Entity<InputState>,
     proxy: Entity<InputState>,
     nutdb_url: Entity<InputState>,
     _subscriptions: Vec<Subscription>,
 }
-
-impl EventEmitter<SettingsEvent> for SettingsPage {}
 
 impl SettingsPage {
     pub fn new(tools: Tools, window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -53,85 +43,13 @@ impl SettingsPage {
         ];
 
         Self {
-            backend_version: tools.backend_version(),
             keys_installed: tools.has_keys(),
             tools,
-            update_status: None,
-            checking: false,
             temp_dir,
             proxy,
             nutdb_url,
             _subscriptions: subscriptions,
         }
-    }
-
-    fn check_update(&mut self, cx: &mut Context<Self>) {
-        self.checking = true;
-        self.update_status = None;
-        cx.notify();
-        let tools = self.tools.clone();
-        let installed = self.backend_version.clone();
-        let lookup = cx.background_executor().spawn(async move { github::latest_backend_release() });
-        cx.spawn(async move |this, cx| {
-            let release = lookup.await;
-            let Some(release) = release else {
-                let _ = this.update(cx, |this, cx| {
-                    this.update_status = Some("Could not reach GitHub. Check your network connection.".into());
-                    this.checking = false;
-                    cx.notify();
-                });
-                return;
-            };
-            if tools.has_backend() && !installed.is_empty() && release.tag == installed {
-                let _ = this.update(cx, |this, cx| {
-                    this.update_status = Some(format!("Already up to date ({installed})"));
-                    this.checking = false;
-                    cx.notify();
-                });
-                return;
-            }
-            let _ = this.update(cx, |this, cx| {
-                this.update_status = Some(format!("Downloading {}...", release.tag));
-                cx.notify();
-            });
-            let url = release.url.clone();
-            let install_tools = tools.clone();
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    let bytes = github::download(&url)?;
-                    install_tools.install_backend(&bytes)
-                })
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                this.checking = false;
-                match result.and_then(|_| this.tools.save_backend_version(&release.tag)) {
-                    Ok(()) => {
-                        this.backend_version = release.tag.clone();
-                        this.update_status = Some(format!("Updated to {}", release.tag));
-                        cx.emit(SettingsEvent::BackendChanged);
-                    }
-                    Err(e) => this.update_status = Some(format!("Update failed: {e}")),
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    fn import_backend(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        pick_file("Select nscb_rust backend binary", window, cx, |this: &mut Self, path, _, cx| {
-            match this.tools.import_backend(std::path::Path::new(&path)) {
-                Ok(()) => {
-                    this.backend_version.clear();
-                    let _ = this.tools.save_backend_version("");
-                    this.update_status = Some("Backend imported manually".into());
-                    cx.emit(SettingsEvent::BackendChanged);
-                }
-                Err(e) => this.update_status = Some(format!("Failed to import backend: {e}")),
-            }
-            cx.notify();
-        });
     }
 
     fn import_keys(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -201,40 +119,17 @@ fn row(title: &str, description: impl Into<String>, control: impl IntoElement) -
 impl Render for SettingsPage {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let has_temp_dir = !input_value(&self.temp_dir, cx).is_empty();
-        let backend_desc = if self.backend_version.is_empty() {
-            "Unknown version (manually imported)".to_string()
-        } else {
-            format!("Installed: {}", self.backend_version)
-        };
 
         let tools_rows = vec![
             row(
-                "Backend Binary (nscb_rust)",
-                backend_desc,
-                v_flex()
-                    .items_end()
-                    .gap(px(6.))
-                    .child(
-                        h_flex()
-                            .gap(px(8.))
-                            .child(
-                                Button::new("check-update")
-                                    .small()
-                                    .label(if self.checking { "Checking..." } else { "Check for Update" })
-                                    .disabled(self.checking)
-                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.check_update(cx))),
-                            )
-                            .child(
-                                Button::new("import-backend")
-                                    .small()
-                                    .ghost()
-                                    .label("Import Manually")
-                                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.import_backend(window, cx))),
-                            ),
-                    )
-                    .when_some(self.update_status.clone(), |this, status| {
-                        this.child(div().text_size(px(12.)).text_color(hex(theme::TEXT_MUTED)).child(status))
-                    }),
+                "Backend Engine",
+                "Built into the app; no separate download needed.",
+                h_flex().justify_end().child(
+                    div()
+                        .text_size(px(13.))
+                        .text_color(hex(theme::TEXT_SECONDARY))
+                        .child(format!("nscb_rust v{}", nscb::VERSION)),
+                ),
             ),
             row(
                 "Encryption Keys",
@@ -287,7 +182,7 @@ impl Render for SettingsPage {
 
         page()
             .id("settings")
-            .child(page_header(AppIcon::Settings, Accent::Settings, "Settings", "Manage backend binary and encryption keys"))
+            .child(page_header(AppIcon::Settings, Accent::Settings, "Settings", "Manage encryption keys and backend options"))
             .child(section("Tools", tools_rows))
             .child(section("Network", network_rows))
     }

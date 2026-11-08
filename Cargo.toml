@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "crates/nscb"]
+resolver = "2"
+
 [package]
 name = "nscb-desktop"
 version = "2.7.2"
@@ -12,11 +16,13 @@ path = "src/main.rs"
 
 [dependencies]
 gpui-kit = "0.9"
+nscb = { path = "crates/nscb" }
 futures = "0.3"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-ureq = { version = "3", features = ["json"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+clap = "4"
 
 [dev-dependencies]
 gpui-kit = { version = "0.9", features = ["test-support"] }

@@ -1,6 +1,7 @@
 //! NSCB Desktop: a GPUI (gpui-kit) front end for the nscb_rust backend.
 
 pub mod core;
+pub mod engine;
 pub mod runner;
 pub mod ui;
 

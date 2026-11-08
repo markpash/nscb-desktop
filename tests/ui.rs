@@ -1,32 +1,53 @@
-//! UI integration tests: the real app window, rendered headlessly, driving a fake
-//! nscb_rust backend script.
-#![cfg(unix)]
+//! UI integration tests: the real app window, rendered headlessly, with a fake engine
+//! standing in for nscb.
 
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{
     px, size, AppContext, Bounds, Entity, Point, TestAppContext, WindowBounds, WindowHandle, WindowOptions,
 };
 use nscb_desktop::core::batch::GameStatus;
-use nscb_desktop::core::tools::{nscb_binary_name, Tools};
+use nscb_desktop::core::tools::Tools;
+use nscb_desktop::engine::{Engine, EngineMsg, RunContext};
 use nscb_desktop::ui::app::{NscbApp, PageId};
 use nscb_desktop::ui::pages::batch_merge::BatchMergePage;
 use nscb_desktop::ui::pages::operation::OperationPage;
 use nscb_desktop::ui::widgets::FileTarget;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const FAKE_BACKEND: &str = r#"#!/bin/sh
-echo "[ARGS] $*"
-out=""; prev=""
-for a in "$@"; do [ "$prev" = "-o" ] && out="$a"; prev="$a"; done
-case "$*" in *slow*) sleep 5;; esac
-case "$*" in "-d "*) [ -n "$out" ] && touch "$out/Merged [0100000000010000] [v0] (1G).xci";; esac
-printf 'Working [##] 2/4\r' >&2
-echo "Done!"
-case "$*" in *fail*) echo "error: simulated failure" >&2; exit 3;; esac
-exit 0
-"#;
+/// Mimics nscb: echoes its arguments, reports progress, honours cancel, writes a merge
+/// output into `-o`, and fails when an argument contains "fail".
+struct FakeEngine;
+
+impl Engine for FakeEngine {
+    fn run(&self, args: Vec<String>, ctx: RunContext) -> i32 {
+        ctx.line(format!("[ARGS] {}", args.join(" ")));
+        if args.iter().any(|a| a.contains("slow")) {
+            for _ in 0..500 {
+                if ctx.is_cancelled() {
+                    ctx.error("I/O error: Operation cancelled");
+                    return 1;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        if args.first().map(String::as_str) == Some("-d") {
+            if let Some(i) = args.iter().position(|a| a == "-o") {
+                let out = PathBuf::from(&args[i + 1]).join("Merged [0100000000010000] [v0] (1G).xci");
+                fs::write(out, "x").unwrap();
+            }
+        }
+        ctx.emit(EngineMsg::Progress { percent: 50.0, message: "Working... 2 / 4".into() });
+        ctx.line("Done!");
+        if args.iter().any(|a| a.contains("fail")) {
+            ctx.error("simulated failure");
+            return 3;
+        }
+        0
+    }
+}
 
 struct Fixture {
     root: PathBuf,
@@ -38,10 +59,6 @@ impl Fixture {
         let root = std::env::temp_dir().join(format!("nscb-ui-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let tools = Tools::at(root.join("tools")).unwrap();
-        let backend = tools.dir().join(nscb_binary_name());
-        fs::write(&backend, FAKE_BACKEND).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&backend, fs::Permissions::from_mode(0o755)).unwrap();
         if with_keys {
             fs::write(tools.keys_path(), "fake").unwrap();
         }
@@ -76,7 +93,7 @@ fn open_app(cx: &mut TestAppContext, tools: Tools) -> (WindowHandle<gpui_kit::ba
         let (window, app) = gpui_kit::open_window(
             WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() },
             cx,
-            |window, cx| cx.new(|cx| NscbApp::with_update_check(tools, false, window, cx)),
+            |window, cx| cx.new(|cx| NscbApp::with_engine(tools, Arc::new(FakeEngine), false, window, cx)),
         )
         .unwrap();
         (window.downcast().unwrap(), app)
@@ -87,7 +104,7 @@ fn page<T: 'static>(cx: &mut TestAppContext, app: &Entity<NscbApp>, id: PageId) 
     cx.update(|cx| app.read(cx).page(id).unwrap().downcast::<T>().unwrap())
 }
 
-/// Poll in real time; the backend is a real child process.
+/// Poll in real time; the engine runs on a real worker thread.
 fn wait_until(cx: &mut TestAppContext, what: &str, mut done: impl FnMut(&mut TestAppContext) -> bool) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -137,7 +154,7 @@ fn navigation_switches_pages_and_keeps_state(cx: &mut TestAppContext) {
         window.render_frame(cx);
         window.click("nav-Settings", cx);
         window.render_frame(cx);
-        assert!(window.try_find("check-update").is_some());
+        assert!(window.try_find("import-keys").is_some());
         assert!(window.try_find("drop-zone").is_none());
         window.click("nav-Compress", cx);
         window.render_frame(cx);
@@ -199,7 +216,7 @@ fn failed_run_reports_exit_code(cx: &mut TestAppContext) {
         assert_eq!(run.message, "Completed with exit code: 3");
         assert!(run.lines.iter().any(|l| l == "ERROR: simulated failure"), "{:?}", run.lines);
         assert!(
-            run.lines.iter().any(|l| l.starts_with("ERROR: nscb_rust exited with code 3")),
+            run.lines.iter().any(|l| l.starts_with("ERROR: nscb_rust failed with code 3")),
             "{:?}",
             run.lines
         );
