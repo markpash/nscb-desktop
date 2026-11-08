@@ -325,6 +325,8 @@ pub enum VerifyStageKind {
     Decryption,
     Signature,
     Hash,
+    /// NUP containers: superblock, table of contents and record bounds.
+    Structure,
 }
 
 impl VerifyStageKind {
@@ -333,6 +335,7 @@ impl VerifyStageKind {
             VerifyStageKind::Decryption => "Decryption",
             VerifyStageKind::Signature => "Signature",
             VerifyStageKind::Hash => "Hash",
+            VerifyStageKind::Structure => "Structure",
         }
     }
 }
@@ -404,6 +407,9 @@ pub fn verify_report_with(
     on_event: &mut dyn FnMut(VerifyEvent),
 ) -> Result<VerifyReport> {
     let ext = path.rsplit('.').next().unwrap_or("").to_lowercase();
+    if ext == "nup" {
+        return crate::ops::verify_nup::verify_nup_report_with(Path::new(path), level, on_event);
+    }
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
     let entries: Vec<ContainerEntry> = match ext.as_str() {

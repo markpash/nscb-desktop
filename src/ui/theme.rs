@@ -81,6 +81,7 @@ pub fn ext_color(ext: &str) -> u32 {
         "XCZ" => 0xf0883e,
         "NCZ" => 0xf778ba,
         "NCA" => 0x8b949e,
+        "NUP" => 0x39c5cf,
         "FOLDER" => 0xe3b341,
         _ => TEXT_MUTED,
     }

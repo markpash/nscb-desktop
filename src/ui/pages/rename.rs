@@ -19,7 +19,7 @@ use gpui_kit::prelude::*;
 use gpui_kit::{div, px, AnyElement, ClickEvent, Context, Entity, FontWeight, IntoElement, SharedString, Subscription, Window};
 
 const DROP: DropSpec = DropSpec {
-    accept: &["nsp", "nsx", "nsz", "xci", "xcz"],
+    accept: &["nsp", "nsx", "nsz", "xci", "xcz", "nup"],
     hint: "Drop files or folders to rename",
     allow_folders: true,
 };

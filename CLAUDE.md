@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-NSCB Desktop is a native Rust desktop app built with GPUI Kit (`gpui-kit` 0.9: GPUI + gpui-component) for Nintendo Switch file operations (compress, decompress, merge, convert, split, repack, rename, verify). It links nscb_rust (vendored as the workspace crate `crates/nscb`) and calls it in-process.
+NSCB Desktop is a native Rust desktop app built with GPUI Kit (`gpui-kit` 0.9: GPUI + gpui-component) for Nintendo Switch file operations (compress, decompress, merge, convert, split, repack, rename, verify). NUP containers (unencrypted ExeFS/RomFS dumps, spec at github.com/a55uka/nup) support info, verify and rename only. It links nscb_rust (vendored as the workspace crate `crates/nscb`) and calls it in-process.
 
 ## Tech Stack
 
@@ -33,7 +33,7 @@ NSCB Desktop is a native Rust desktop app built with GPUI Kit (`gpui-kit` 0.9: G
 | `src/jobs.rs` | `Job`/`JobKind`/`Step`/`Outcome` |
 | `src/engine.rs` | `Engine` trait + `NscbEngine` (calls `nscb::api`) |
 | `src/runner.rs` | Worker-thread runner + `RunnerEvent` |
-| `crates/nscb/` | Vendored nscb_rust; `src/api.rs` is the typed API, `src/util/report.rs` the progress/cancel hooks |
+| `crates/nscb/` | Vendored nscb_rust; `src/api.rs` is the typed API, `src/util/report.rs` the progress/cancel hooks, `src/formats/nup.rs` + `src/ops/verify_nup.rs` the NUP reader and verifier (ours) |
 | `src/core/batch.rs` | Batch merge scan + existing-output matching |
 | `src/core/tools.rs` | Tools dir, keys import, settings, verify file list |
 | `src/core/github.rs` | App update check |
@@ -65,11 +65,11 @@ cargo packager --release        # Bundles in target/packages/ (needs cargo-packa
 | `merge(inputs, out_dir, &MergeOptions)` / `create(input_dir, out_dir)` | output file |
 | `split(input, out_dir)` / `split_to_files(input, out_dir, Format)` | new entries in `out_dir` |
 | `rename(target, RenameOptions)` | `Vec<RenameOutcome>` |
-| `inspect(input)` | `ContainerInfo` (titles, versions, firmware, contents) |
-| `verify(input, VerifyLevel)` / `verify_with(.., on_stage)` | `VerifyReport` (per-stage verdicts + findings, full text for saving); `verify_with` streams `VerifyEvent`s (items to check, each finding, each completed stage) |
+| `inspect(input)` | `ContainerInfo` (titles, versions, firmware, contents; `format` says NCA or NUP, and NUP titles have no firmware/key-gen/SDK fields but a `build_id`) |
+| `verify(input, VerifyLevel)` / `verify_with(.., on_stage)` | `VerifyReport` (per-stage verdicts + findings, full text for saving); `verify_with` streams `VerifyEvent`s (items to check, each finding, each completed stage). For `.nup`: a `Structure` stage at every level, plus `Hash` (every file's SHA-256) at lv3 |
 | `nutdb_refresh()` / `nutdb_lookup(title_id)` | `NutdbRefresh` / `TitleLookup` |
 
-The vendored CLI (`cargo run -p nscb -- --help`) still works and prints as upstream.
+`.nup` inputs to `inspect`/`verify`/`rename` need no keys. The vendored CLI (`cargo run -p nscb -- --help`) still works and prints as upstream (it has no NUP support).
 
 ## Progress
 

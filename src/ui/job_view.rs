@@ -14,7 +14,7 @@ use gpui_kit::component::{h_flex, v_flex, Sizable};
 use gpui_kit::prelude::*;
 use gpui_kit::{div, px, AnyElement, App, FontWeight, IntoElement, SharedString};
 use nscb::api::{
-    ContainerInfo, FindingStatus, RenameOutcome, RenameSkip, TitleInfo, TitleKind, TitleLookup,
+    ContainerFormat, ContainerInfo, FindingStatus, RenameOutcome, RenameSkip, TitleInfo, TitleKind, TitleLookup,
     VerifyEvent, VerifyFinding, VerifyLevel, VerifyReport, VerifyStageKind,
 };
 use std::path::{Path, PathBuf};
@@ -409,7 +409,7 @@ pub fn item_detail(id: &str, item: &ItemState) -> Option<AnyElement> {
                 h_flex()
                     .gap(px(6.))
                     .child(verdict_pill(report))
-                    .child(muted(level_label(report.level)))
+                    .child(muted(report_label(report)))
                     .into_any_element(),
             ),
             Outcome::Info(info) => Some(muted(titles_summary(info)).into_any_element()),
@@ -462,7 +462,16 @@ fn field(label: &str, value: impl Into<SharedString>) -> impl IntoElement {
         .child(div().text_size(px(13.)).child(value.into()))
 }
 
-fn title_card(title: &TitleInfo) -> impl IntoElement {
+/// A build ID for display: trailing zero bytes (padding after a 20-byte GNU build ID) dropped.
+fn display_build_id(id: &str) -> String {
+    let mut id = id;
+    while id.len() > 2 && id.ends_with("00") {
+        id = &id[..id.len() - 2];
+    }
+    id.to_string()
+}
+
+fn title_card(title: &TitleInfo, format: ContainerFormat) -> impl IntoElement {
     let (kind, color) = kind_label(title.kind);
     let name = if title.name.is_empty() { "Unknown title".to_string() } else { title.name.clone() };
     let mut fields: Vec<AnyElement> = Vec::new();
@@ -476,17 +485,20 @@ fn title_card(title: &TitleInfo) -> impl IntoElement {
     if let Some(n) = title.dlc_number {
         fields.push(field("DLC number", n.to_string()).into_any_element());
     }
-    match &title.required_firmware {
-        Some(fw) => fields.push(field("Required firmware", format!("{fw} ({})", title.required_system_version)).into_any_element()),
-        None => fields.push(field("Required game version", format!("{}", title.required_system_version)).into_any_element()),
+    // NUP content is unencrypted ExeFS/RomFS: no firmware, key generation or SDK records.
+    if format == ContainerFormat::Nca {
+        match &title.required_firmware {
+            Some(fw) => fields.push(field("Required firmware", format!("{fw} ({})", title.required_system_version)).into_any_element()),
+            None => fields.push(field("Required game version", format!("{}", title.required_system_version)).into_any_element()),
+        }
+        fields.push(
+            field("Key generation", format!("{} ({})", title.key_generation, title.key_generation_firmware)).into_any_element(),
+        );
+        if let Some((rsv, fw)) = &title.patchable_to {
+            fields.push(field("Patchable to", format!("{fw} ({rsv})")).into_any_element());
+        }
+        fields.push(field("SDK", title.content_sdk_version.clone()).into_any_element());
     }
-    fields.push(
-        field("Key generation", format!("{} ({})", title.key_generation, title.key_generation_firmware)).into_any_element(),
-    );
-    if let Some((rsv, fw)) = &title.patchable_to {
-        fields.push(field("Patchable to", format!("{fw} ({rsv})")).into_any_element());
-    }
-    fields.push(field("SDK", title.content_sdk_version.clone()).into_any_element());
     fields.push(field("Size", human_bytes(title.total_size)).into_any_element());
 
     v_flex()
@@ -504,6 +516,7 @@ fn title_card(title: &TitleInfo) -> impl IntoElement {
         )
         .child(h_flex().flex_wrap().gap(px(14.)).children(fields))
         .when(!title.languages.is_empty(), |this| this.child(field("Languages", title.languages.join(", "))))
+        .children(title.build_id.as_deref().map(|id| field("Build ID", display_build_id(id))))
         .child(
             v_flex()
                 .gap(px(2.))
@@ -534,7 +547,7 @@ pub fn info_results(job: &JobView) -> Option<impl IntoElement> {
                             .child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).child(item.label.clone()))
                             .child(muted(titles_summary(info))),
                     )
-                    .children(info.titles.iter().map(title_card))
+                    .children(info.titles.iter().map(|t| title_card(t, info.format)))
                     .into_any_element(),
             ),
             _ => None,
@@ -547,11 +560,28 @@ pub fn info_results(job: &JobView) -> Option<impl IntoElement> {
 // Verification
 // ---------------------------------------------------------------------------
 
+fn is_nup(path: &Path) -> bool {
+    path.extension().is_some_and(|e| e.eq_ignore_ascii_case("nup"))
+}
+
 pub fn level_label(level: VerifyLevel) -> &'static str {
     match level {
         VerifyLevel::Decryption => "Decryption check",
         VerifyLevel::Signature => "Decryption + signature check",
         VerifyLevel::Full => "Full check (decryption, signature, hashes)",
+    }
+}
+
+/// What a finished verification checked. NUP reports have a structure stage instead of
+/// decryption and signature stages.
+fn report_label(report: &VerifyReport) -> &'static str {
+    if report.stages.iter().any(|s| s.kind == VerifyStageKind::Structure) {
+        match report.level {
+            VerifyLevel::Full => "Structure + file hash check",
+            _ => "Structure check",
+        }
+    } else {
+        level_label(report.level)
     }
 }
 
@@ -587,7 +617,15 @@ fn save_report_button(id: String, source: &Path, report: &VerifyReport) -> Butto
     })
 }
 
-fn expected_stages(level: VerifyLevel) -> &'static [VerifyStageKind] {
+/// The stages a verification of `source` at `level` runs. A NUP (unencrypted) has no
+/// decryption or signature stage.
+fn expected_stages(level: VerifyLevel, source: &Path) -> &'static [VerifyStageKind] {
+    if is_nup(source) {
+        return match level {
+            VerifyLevel::Full => &[VerifyStageKind::Structure, VerifyStageKind::Hash],
+            _ => &[VerifyStageKind::Structure],
+        };
+    }
     match level {
         VerifyLevel::Decryption => &[VerifyStageKind::Decryption],
         VerifyLevel::Signature => &[VerifyStageKind::Decryption, VerifyStageKind::Signature],
@@ -687,7 +725,7 @@ fn verify_card(index: usize, item: &ItemState, source: &Path, level: VerifyLevel
         _ => None,
     };
     let level = report.map(|r| r.level).unwrap_or(level);
-    let stages = expected_stages(level);
+    let stages = expected_stages(level, source);
     let (mut rows, completed) = verify_rows(item);
     let running = item.status == ItemStatus::Running;
     // The stage being checked: the first expected stage that hasn't completed.

@@ -63,6 +63,16 @@ The upstream repository does not include a license.
 - `examples/bench_verify.rs` (new): read, SHA-256 and full-verify benchmark.
 - `examples/bench_decompress.rs` (new): full decompress with phase timings and an
   optional byte comparison against the original.
+- NUP containers (new, <https://github.com/a55uka/nup> SPEC.md v1): `src/formats/nup.rs`
+  (validating reader: superblock, TOC SHA-256, record bounds, tree walk, meta TLVs, build
+  ID, per-file SHA-256 over raw/zstd extents) and `src/ops/verify_nup.rs` (`Structure`
+  stage, and at lv3 a `Hash` stage that hashes each distinct extent once on up to 8
+  threads). `ops/info.rs`: `inspect_nup()`, `ContainerFormat` on `ContainerInfo`,
+  `TitleInfo::build_id`. `ops/verify.rs`: `VerifyStageKind::Structure`, `.nup` dispatch.
+  `cli.rs`: rename accepts `.nup` (title records from package records, name from the
+  meta block or NACP). `api.rs`: `.nup` inspect/verify skip key loading; rename of a
+  single `.nup` works without keys. 24.5 GiB NUP (186,592 files) full verify on an M2
+  Max: ~10 s.
 - `examples/bench_compress.rs` (new): AES-CTR throughput, sampled compression rate per
   zstd level, and a full compress with phase timings.
 

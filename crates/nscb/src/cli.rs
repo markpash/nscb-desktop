@@ -461,7 +461,7 @@ fn is_supported_rename_extension(path: &Path) -> bool {
         .map(|ext| {
             matches!(
                 ext.to_ascii_lowercase().as_str(),
-                "nsp" | "nsx" | "nsz" | "xci" | "xcz"
+                "nsp" | "nsx" | "nsz" | "xci" | "xcz" | "nup"
             )
         })
         .unwrap_or(false)
@@ -1297,6 +1297,14 @@ fn collect_title_records(
                     &mut title_name,
                 );
             }
+            "nup" => {
+                let _ = collect_title_records_from_nup(
+                    path_str,
+                    &mut by_title,
+                    &mut latest_version,
+                    &mut title_name,
+                );
+            }
             _ => {
                 // Decompressed temp files may not have extension.
                 if collect_title_records_from_nsp(
@@ -1326,6 +1334,41 @@ fn collect_title_records(
 
     drop(temp_files);
     (by_title, latest_version, title_name)
+}
+
+/// Title records from a NUP's package records; the name from its application metadata.
+fn collect_title_records_from_nup(
+    path: &str,
+    out: &mut HashMap<u64, MergeTitleRecord>,
+    latest_version: &mut Option<u32>,
+    title_name: &mut Option<String>,
+) -> std::result::Result<(), ()> {
+    use crate::formats::nup::{Nup, PackageKind};
+    let nup = Nup::open(Path::new(path)).map_err(|_| ())?;
+    let has_base = nup.packages.iter().any(|p| p.kind == PackageKind::Base);
+    for pkg in &nup.packages {
+        let (kind, title_id) = match pkg.kind {
+            PackageKind::Base => (MergeKind::Base, pkg.title_id),
+            // NUP update records may carry the base title ID; keep them apart from the base.
+            PackageKind::Update if has_base && pkg.title_id & 0xFFF == 0 => (MergeKind::Update, pkg.title_id | 0x800),
+            PackageKind::Update => (MergeKind::Update, pkg.title_id),
+            PackageKind::Addon => (MergeKind::Dlc, pkg.title_id),
+            PackageKind::AddonUpdate | PackageKind::System => continue,
+        };
+        upsert_record(out, MergeTitleRecord { title_id, version: pkg.version, kind });
+        if latest_version.is_none_or(|v| pkg.version > v) {
+            *latest_version = Some(pkg.version);
+        }
+    }
+    if title_name.is_none() {
+        let meta = nup.meta(nup.app_package()).map_err(|_| ())?;
+        *title_name = meta
+            .title_name
+            .clone()
+            .or_else(|| meta.nacp.as_deref().and_then(|n| crate::formats::nacp::parse_title(n).ok()).filter(|t| !t.is_empty()))
+            .or_else(|| meta.localized_title("en-us").map(str::to_string));
+    }
+    Ok(())
 }
 
 fn collect_title_records_from_nsp(
@@ -1606,6 +1649,19 @@ fn python_title_spacing(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn nup_rename_plan_uses_package_records_and_name() {
+        let path = crate::formats::nup::tests::write_temp("rename", &crate::formats::nup::tests::sample());
+        let path = path.to_string_lossy().to_string();
+        let ks = crate::keys::KeyStore::from_string("").unwrap();
+        let (records, latest, name) = super::collect_title_records(&[path.as_str()], &ks, None);
+        let plan = build_name_plan(&records, latest, name, None, &path, false);
+        assert_eq!(plan.display_name, "Sample Game");
+        assert_eq!(plan.title_id, "0100000000010000");
+        assert_eq!(plan.version, 65536);
+        assert_eq!(plan.content_suffix, " (1G+1U+1D)");
+    }
+
     use super::{
         build_content_suffix, build_display_name_with_options, build_merge_filename,
         build_name_plan, build_rename_filename_fallback, build_version_tag, change_ext,

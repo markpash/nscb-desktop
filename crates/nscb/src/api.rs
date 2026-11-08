@@ -14,7 +14,7 @@ use crate::nutdb::{base_title_id, NutdbStore};
 
 pub use crate::cli::{DlcRenameMode, NoVersionMode, RenameMode, RenameOptions, RenameOutcome, RenameSkip};
 pub use crate::nutdb::RefreshStatus;
-pub use crate::ops::info::{ContainerInfo, ContentInfo, ContentKind, TitleInfo, TitleKind};
+pub use crate::ops::info::{ContainerFormat, ContainerInfo, ContentInfo, ContentKind, TitleInfo, TitleKind};
 pub use crate::ops::verify::{
     FindingStatus, VerifyEvent, VerifyFinding, VerifyLevel, VerifyReport, VerifyStage, VerifyStageKind,
 };
@@ -86,6 +86,10 @@ pub struct Nscb {
 
 fn path_str(path: &Path) -> String {
     path.to_string_lossy().into_owned()
+}
+
+fn is_nup_path(path: &Path) -> bool {
+    crate::formats::nup::has_nup_extension(&path.to_string_lossy())
 }
 
 fn dir_entries(dir: &Path) -> HashSet<PathBuf> {
@@ -224,20 +228,29 @@ impl Nscb {
     }
 
     /// Rename a file, or every supported file under a folder, from metadata and NUTDB.
+    /// A `.nup` file needs no keys.
     pub fn rename(&self, target: &Path, options: RenameOptions) -> Result<Vec<RenameOutcome>> {
-        let ks = self.keys()?;
+        let ks = match self.keys() {
+            Ok(ks) => ks,
+            Err(_) if target.is_file() && is_nup_path(target) => KeyStore::from_string("")?,
+            Err(e) => return Err(e),
+        };
         let temp = self.temp_dir()?;
         let index = self.nutdb.ensure_index()?;
         crate::cli::rename_target(target, &ks, &index, options, temp.as_deref())
     }
 
-    /// Read title metadata from a container.
+    /// Read title metadata from a container. A `.nup` file needs no keys.
     pub fn inspect(&self, input: &Path) -> Result<ContainerInfo> {
+        if is_nup_path(input) {
+            return crate::ops::info::inspect_nup(input);
+        }
         let ks = self.keys()?;
         crate::ops::info::inspect(&path_str(input), &ks)
     }
 
-    /// Verify a container's integrity.
+    /// Verify a container's integrity. For a `.nup` (unencrypted), every level checks
+    /// its structure and `VerifyLevel::Full` also every file's SHA-256.
     pub fn verify(&self, input: &Path, level: VerifyLevel) -> Result<VerifyReport> {
         self.verify_with(input, level, &mut |_| {})
     }
@@ -250,6 +263,9 @@ impl Nscb {
         level: VerifyLevel,
         on_event: &mut dyn FnMut(VerifyEvent),
     ) -> Result<VerifyReport> {
+        if is_nup_path(input) {
+            return crate::ops::verify_nup::verify_nup_report_with(input, level, on_event);
+        }
         let ks = self.keys()?;
         crate::ops::verify::verify_report_with(&path_str(input), &ks, level, on_event)
     }
@@ -314,6 +330,25 @@ mod tests {
         let dir = temp("keys");
         let nscb = Nscb::new(Config { keys_path: Some(dir.join("missing.keys")), ..Default::default() });
         assert!(nscb.inspect(&dir.join("game.nsp")).is_err());
+    }
+
+    #[test]
+    fn nup_needs_no_keys() {
+        let dir = temp("nup");
+        let path = dir.join("Sample.nup");
+        fs::write(&path, crate::formats::nup::tests::sample()).unwrap();
+        let nscb = Nscb::new(Config { keys_path: Some(dir.join("missing.keys")), ..Default::default() });
+        let info = nscb.inspect(&path).unwrap();
+        assert_eq!(info.format, ContainerFormat::Nup);
+        let base = &info.titles[0];
+        assert_eq!((base.name.as_str(), base.publisher.as_str(), base.kind), ("Sample Game", "Studio", TitleKind::Base));
+        assert_eq!(base.build_id.as_deref(), Some("AB".repeat(32).as_str()));
+        assert_eq!(base.contents.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["ExeFS (2 files)", "RomFS (2 files)"]);
+        // The update inherits the game's name but keeps its own display version.
+        assert_eq!((info.titles[1].name.as_str(), info.titles[1].display_version.as_str()), ("Sample Game", "1.0.1"));
+        assert_eq!(info.titles[2].kind, TitleKind::Dlc);
+        assert_eq!(info.titles[2].base_title_id, "0100000000010000");
+        assert!(nscb.verify(&path, VerifyLevel::Full).unwrap().passed);
     }
 
     #[test]

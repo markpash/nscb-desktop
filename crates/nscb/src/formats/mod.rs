@@ -4,6 +4,7 @@ pub mod nacp;
 pub mod nca;
 pub mod ncz;
 pub mod nsp;
+pub mod nup;
 pub mod pfs0;
 pub mod ticket;
 pub mod types;

@@ -1,6 +1,6 @@
 # NSCB Desktop
 
-Modern desktop GUI for Nintendo Switch game file operations: compress, decompress, merge, convert, split, repack, rename, and verify (NSP, XCI, NSZ, XCZ, NCZ).
+Modern desktop GUI for Nintendo Switch game file operations: compress, decompress, merge, convert, split, repack, rename, and verify (NSP, XCI, NSZ, XCZ, NCZ, plus info/verify/rename for NUP).
 
 Built in Rust with [GPUI Kit](https://gpui-kit.com) (GPUI + gpui-component). Powered by [nscb_rust](https://github.com/cxfcxf/nscb_rust), which is built into the app as a library (vendored in `crates/nscb`).
 
@@ -17,6 +17,7 @@ Built in Rust with [GPUI Kit](https://gpui-kit.com) (GPUI + gpui-component). Pow
 - NUTDB utilities: refresh cache, look up title IDs
 - Verify container integrity (NSP, NSX, NSZ, XCI, XCZ) at three levels: decryption (lv1), signature (lv2), or full (lv3)
 - View file info: titles, versions, firmware requirements, languages and contents
+- NUP containers ([NUP spec](https://github.com/a55uka/nup), unencrypted dumps; no keys needed): view info (packages, versions, names, build ID, ExeFS/RomFS sizes), verify (structure at every level, plus every file's SHA-256 at lv3) and rename. NUP holds decrypted files rather than NCAs, so the NSP/XCI operations (compress, convert, merge, split) don't apply to it
 - Drag & drop files or folders (rename supports recursive folder input)
 - Live progress with per-file status, output files you can reveal in Finder/Explorer, and structured results (title info cards, verification findings, rename results)
 - Batch support for compress/decompress/convert/split/rename/verify

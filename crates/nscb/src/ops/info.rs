@@ -111,14 +111,27 @@ pub struct TitleInfo {
     pub key_generation_firmware: String,
     /// Lowest RequiredSystemVersion this title can be patched to (not set for DLC).
     pub patchable_to: Option<(u32, String)>,
-    /// Non-delta contents plus the meta NCA.
+    /// NSO ModuleId of the program's `main`, as hex (NUP only).
+    pub build_id: Option<String>,
+    /// Non-delta contents plus the meta NCA; for NUP, the package's ExeFS and RomFS.
     pub contents: Vec<ContentInfo>,
     pub total_size: u64,
+}
+
+/// What kind of container was inspected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ContainerFormat {
+    /// NSP/NSZ/XCI/XCZ: encrypted NCAs. Firmware, key generation and SDK fields apply.
+    #[default]
+    Nca,
+    /// NUP: unencrypted ExeFS/RomFS trees. Only IDs, versions, names and sizes apply.
+    Nup,
 }
 
 /// Everything `inspect` found in a container.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContainerInfo {
+    pub format: ContainerFormat,
     pub titles: Vec<TitleInfo>,
 }
 
@@ -166,15 +179,114 @@ pub fn inspect(path: &str, ks: &KeyStore) -> Result<ContainerInfo> {
                 key_generation: t.key_generation,
                 key_generation_firmware: strip_parens(python_fw_range_kg(t.key_generation)),
                 patchable_to: (!is_dlc).then(|| (min_rsv, strip_parens(&python_fw_range_rsv(min_rsv)))),
+                build_id: None,
                 contents,
                 total_size,
             }
         })
         .collect();
-    Ok(ContainerInfo { titles })
+    Ok(ContainerInfo { format: ContainerFormat::Nca, titles })
+}
+
+/// Title metadata from a NUP container (no keys needed).
+pub fn inspect_nup(path: &Path) -> Result<ContainerInfo> {
+    use crate::formats::nup::{Nup, PackageKind};
+
+    let nup = Nup::open(path)?;
+    let app_meta = nup.meta(nup.app_package())?;
+    let mut titles = Vec::with_capacity(nup.packages.len());
+    for pkg in &nup.packages {
+        let meta = nup.meta(pkg)?;
+        let kind = match pkg.kind {
+            PackageKind::Base => TitleKind::Base,
+            PackageKind::Update => TitleKind::Update,
+            PackageKind::Addon => TitleKind::Dlc,
+            PackageKind::AddonUpdate | PackageKind::System => TitleKind::Other,
+        };
+        // Application metadata lives on the base (or first) package; DLC names are their own.
+        let fallback = (kind != TitleKind::Dlc).then_some(&app_meta);
+        let nacp = meta.nacp.as_deref().or(fallback.and_then(|m| m.nacp.as_deref())).and_then(parse_nacp_info);
+        let pick = |own: &Option<String>, app: Option<&Option<String>>, from_nacp: Option<&String>| {
+            own.clone()
+                .or_else(|| app.cloned().flatten())
+                .or_else(|| from_nacp.filter(|s| !s.is_empty()).cloned())
+                .unwrap_or_default()
+        };
+        let name = pick(&meta.title_name, fallback.map(|m| &m.title_name), nacp.as_ref().map(|c| &c.title));
+        let name = if name.is_empty() {
+            meta.localized_title("en-us").or(fallback.and_then(|m| m.localized_title("en-us"))).unwrap_or_default().to_string()
+        } else {
+            name
+        };
+        let publisher = pick(&meta.publisher, fallback.map(|m| &m.publisher), nacp.as_ref().map(|c| &c.publisher));
+        // Each package has its own display version: never inherited.
+        let display_version = meta
+            .display_version
+            .clone()
+            .or_else(|| nacp.as_ref().map(|c| c.display_version.clone()).filter(|s| !s.is_empty()))
+            .unwrap_or_default();
+        let languages = match &nacp {
+            Some(c) if !c.languages.is_empty() => c.languages.iter().map(|l| l.to_string()).collect(),
+            _ => meta.localized_titles.iter().map(|(tag, _)| tag.clone()).collect(),
+        };
+
+        let mut contents = Vec::new();
+        let files_under = |d: u32| -> Result<(usize, u64)> {
+            let files = nup.walk(d)?;
+            Ok((files.len(), files.iter().map(|(_, f)| nup.files[*f as usize].size).sum()))
+        };
+        for (dir, label, kind) in [(pkg.exefs, "ExeFS", ContentKind::Program), (pkg.romfs, "RomFS", ContentKind::Data)] {
+            if let Some(d) = dir {
+                let (count, size) = files_under(d)?;
+                let noun = if count == 1 { "file" } else { "files" };
+                let count_text = crate::formats::nup::group_digits(count);
+                contents.push(ContentInfo { name: format!("{label} ({count_text} {noun})"), size, kind });
+            }
+        }
+        let (_, total_size) = files_under(pkg.root)?;
+
+        let tid = pkg.title_id;
+        let is_dlc = kind == TitleKind::Dlc;
+        let base_id = match kind {
+            TitleKind::Dlc => (tid & !0xFFF).wrapping_sub(0x1000),
+            _ => tid & !0xFFF,
+        };
+        titles.push(TitleInfo {
+            title_id: format!("{tid:016X}"),
+            base_title_id: format!("{base_id:016X}"),
+            kind,
+            version: pkg.version,
+            dlc_number: is_dlc.then(|| dlc_number(tid)),
+            name: python_spacing(&name),
+            publisher,
+            display_version,
+            languages,
+            meta_sdk_version: String::new(),
+            content_sdk_version: String::new(),
+            required_system_version: 0,
+            required_firmware: None,
+            key_generation: 0,
+            key_generation_firmware: String::new(),
+            patchable_to: None,
+            build_id: nup.build_id(pkg, &meta).map(hex::encode_upper),
+            contents,
+            total_size,
+        });
+    }
+    Ok(ContainerInfo { format: ContainerFormat::Nup, titles })
+}
+
+/// NACP language labels of a NUP's application metadata.
+fn nup_language_labels(path: &Path) -> Option<Vec<&'static str>> {
+    let nup = crate::formats::nup::Nup::open(path).ok()?;
+    let meta = nup.meta(nup.app_package()).ok()?;
+    parse_nacp_info(meta.nacp.as_deref()?).map(|c| c.languages)
 }
 
 pub(crate) fn control_language_tag(path: &str, ks: &KeyStore) -> Option<String> {
+    if crate::formats::nup::has_nup_extension(path) {
+        return python_language_tag_from_labels(&nup_language_labels(Path::new(path))?);
+    }
     let report = build_report(path, ks).ok()?;
     let title = report
         .titles
