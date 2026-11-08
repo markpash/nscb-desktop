@@ -46,7 +46,9 @@ Windows x86_64, Linux x86_64, macOS ARM64.
 2. On first launch, the setup wizard prompts you to import **encryption keys** (`prod.keys` or `keys.txt`).
 3. Pick an operation from the sidebar and drop your files.
 
-Keys and settings live in `<OS temp dir>/nscb-desktop-tools` (the same location earlier releases used, so existing setups carry over). Set `NSCB_DESKTOP_TOOLS_DIR` to use a different folder.
+Keys and settings live in the app data folder: `~/Library/Application Support/NSCB Desktop` (macOS), `%APPDATA%\NSCB Desktop` (Windows) or `~/.local/share/nscb-desktop` (Linux). Releases up to 2.7.x kept them in the OS temp folder, where macOS and temp cleaners deleted them; they are moved over automatically on first start. Set `NSCB_DESKTOP_TOOLS_DIR` to use a different folder.
+
+**macOS first launch:** the app isn't notarized by Apple, so macOS says it can't verify the developer. Open **System Settings → Privacy & Security** and click **Open Anyway** (once). If you still see "is damaged and can't be opened" (older builds), run `xattr -dr com.apple.quarantine "/Applications/NSCB Desktop.app"`.
 
 If the system temporary drive is short on space, open **Settings > Tools > Temporary Directory** and select a directory on a larger drive. Leave it blank to keep using the operating system default.
 

@@ -1,7 +1,9 @@
-//! The tools directory: encryption keys and settings.
+//! The app data directory: encryption keys and settings.
 //!
-//! Everything lives in `<os temp dir>/nscb-desktop-tools`, the same location the
-//! previous Tauri build used, so existing installs keep their keys and settings.
+//! It lives in the OS app data folder (`~/Library/Application Support/NSCB Desktop`,
+//! `%APPDATA%\NSCB Desktop`, `$XDG_DATA_HOME/nscb-desktop`). Earlier releases kept these
+//! files in `<os temp dir>/nscb-desktop-tools`, which macOS and temp cleaners empty;
+//! they are moved over on first start.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -13,24 +15,62 @@ pub const SETTING_NUTDB_URL: &str = "nutdbUrl";
 pub const DEFAULT_NUTDB_URL: &str =
     "https://raw.githubusercontent.com/blawar/titledb/master/US.en.json";
 
+/// Folder name inside the OS app data directory.
+const APP_DIR_NAME: &str = if cfg!(any(target_os = "macos", target_os = "windows")) {
+    "NSCB Desktop"
+} else {
+    "nscb-desktop"
+};
+
+/// Files carried over from the legacy location.
+const MIGRATED_FILES: &[&str] = &["prod.keys", "keys.txt", "settings.json"];
+
+/// Where releases up to 2.7.x kept keys and settings.
+pub fn legacy_dir() -> PathBuf {
+    std::env::temp_dir().join("nscb-desktop-tools")
+}
+
 #[derive(Clone, Debug)]
 pub struct Tools {
     dir: PathBuf,
 }
 
 impl Tools {
-    /// The tools directory in the OS temp dir (or `$NSCB_DESKTOP_TOOLS_DIR`), created if missing.
+    /// The app data directory (or `$NSCB_DESKTOP_TOOLS_DIR`), created if missing, with
+    /// keys and settings migrated from the legacy temp location.
     pub fn locate() -> Result<Self, String> {
-        match std::env::var_os("NSCB_DESKTOP_TOOLS_DIR") {
-            Some(dir) if !dir.is_empty() => Self::at(PathBuf::from(dir)),
-            _ => Self::at(std::env::temp_dir().join("nscb-desktop-tools")),
+        if let Some(dir) = std::env::var_os("NSCB_DESKTOP_TOOLS_DIR").filter(|d| !d.is_empty()) {
+            return Self::at(PathBuf::from(dir));
         }
+        let data = dirs::data_dir()
+            .ok_or_else(|| "Could not find the user's app data folder".to_string())?
+            .join(APP_DIR_NAME);
+        let tools = Self::at(data)?;
+        tools.migrate_from(&legacy_dir());
+        Ok(tools)
     }
 
     pub fn at(dir: impl Into<PathBuf>) -> Result<Self, String> {
         let dir = dir.into();
         fs::create_dir_all(&dir).map_err(|e| format!("Failed to create tools dir: {e}"))?;
         Ok(Self { dir })
+    }
+
+    /// Move keys and settings from `legacy` unless this directory already has them.
+    /// Best effort: anything that fails stays where it is.
+    pub fn migrate_from(&self, legacy: &Path) {
+        if legacy == self.dir {
+            return;
+        }
+        for name in MIGRATED_FILES {
+            let (src, dst) = (legacy.join(name), self.dir.join(name));
+            if !src.is_file() || dst.exists() {
+                continue;
+            }
+            if fs::rename(&src, &dst).is_err() && fs::copy(&src, &dst).is_ok() {
+                let _ = fs::remove_file(&src);
+            }
+        }
     }
 
     pub fn dir(&self) -> &Path {
@@ -103,6 +143,25 @@ mod tests {
         assert_eq!(tools.setting(SETTING_PROXY), "https://gh-proxy.org/");
         tools.save_setting(SETTING_PROXY, "").unwrap();
         assert_eq!(tools.setting(SETTING_PROXY), "");
+        let _ = fs::remove_dir_all(tools.dir());
+    }
+
+    #[test]
+    fn migrates_keys_and_settings_without_overwriting() {
+        let legacy = temp_tools("legacy");
+        let tools = temp_tools("migrated");
+        fs::write(legacy.keys_path(), "old keys").unwrap();
+        fs::write(legacy.dir().join("settings.json"), r#"{"proxy":"p"}"#).unwrap();
+        fs::write(tools.dir().join("keys.txt"), "new").unwrap();
+        fs::write(legacy.dir().join("keys.txt"), "stale").unwrap();
+
+        tools.migrate_from(legacy.dir());
+
+        assert_eq!(fs::read_to_string(tools.keys_path()).unwrap(), "old keys");
+        assert_eq!(tools.setting(SETTING_PROXY), "p");
+        assert!(!legacy.keys_path().exists(), "moved, not copied");
+        assert_eq!(fs::read_to_string(tools.dir().join("keys.txt")).unwrap(), "new", "existing files win");
+        let _ = fs::remove_dir_all(legacy.dir());
         let _ = fs::remove_dir_all(tools.dir());
     }
 

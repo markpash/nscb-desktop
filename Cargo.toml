@@ -17,6 +17,7 @@ path = "src/main.rs"
 [dependencies]
 gpui-kit = "0.9"
 nscb = { path = "crates/nscb" }
+dirs = "6"
 futures = "0.3"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
@@ -50,6 +51,9 @@ icons = [
 
 [package.metadata.packager.macos]
 minimum-system-version = "11.0"
+# Ad-hoc sign the whole bundle so a downloaded copy gets the normal "unidentified
+# developer" prompt instead of "is damaged". Use a Developer ID to notarize.
+signing-identity = "-"
 
 [package.metadata.packager.nsis]
 installer-mode = "perMachine"
